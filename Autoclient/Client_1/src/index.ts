@@ -21,8 +21,8 @@ const EXTRA_DELAY_MS = 5000;                 // Espera obligatoria
 //   3 pasos       -> ["SPECIAL:GOLPE_ESCUDO","MASTER:MASTER.TANK_GOLPE_DEFENSA","BASIC"]
 const PATTERN: string[] = [
   "SPECIAL:GOLPE_ESCUDO",
-  "SPECIAL:EMBATE_SANGRIENTO",
-  "BASIC",
+//  "SPECIAL:EMBATE_SANGRIENTO",
+//  "BASIC",
 ];
 
 // ===== Listas de habilidades (IDs y nombres amigables) =====
