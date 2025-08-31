@@ -11,7 +11,7 @@ type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
 const API_URL = "http://localhost:3000";
 const SOCKET_URL = "http://localhost:3000";
-const ROOM_ID = "ZZZ000b";
+const ROOM_ID = "ZZZ000";
 const MY_ID = "playerA";
 
 const readline = new Readline();
@@ -97,14 +97,14 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 /** ---------- Héroe de pruebas con TODAS las skills ---------- */
 const HERO_STATS = {
   hero: {
-    heroType: "FIRE_MAGE",
+    heroType: "TANK",
     level: 1,
-    power: 8 * 1,
-    health: 40 * 1,
-    defense: 10 * 1,
+    power: 10 * 1,
+    health: 44 * 1,
+    defense: 11 * 1,
     attack: 10 * 1,
-    attackBoost: { min: 1, max: 8 },
-    damage: { min: 1, max: 8 },
+    attackBoost: { min: 1, max: 6 },  // 10 + 1d6
+    damage:      { min: 1, max: 4 },
 
     specialActions: ALL_SPECIALS.map(s => ({
       name: s.name,

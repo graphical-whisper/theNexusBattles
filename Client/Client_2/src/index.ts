@@ -10,7 +10,7 @@ type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
 const API_URL = "http://localhost:3000";
 const SOCKET_URL = "http://localhost:3000";
-const ROOM_ID = "ZZZ000b";
+const ROOM_ID = "ZZZ000";
 const MY_ID = "playerB";
 let lastPayload: any = null;
 let turnIndex = 0;
@@ -84,14 +84,14 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 
 /** ---------- Héroe pruebas ---------- */
 const HERO_STATS = {
-  hero: {
-    heroType: "ICE_MAGE",
+  POISON_ROGUE: {
+    heroType: "POISON_ROGUE",
     level: 1,
-    power: 10 * 1,
-    health: 40 * 1,
-    defense: 10 * 1,
+    power: 8 * 1,
+    health: 36 * 1,
+    defense: 8 * 1,
     attack: 10 * 1,
-    attackBoost: { min: 1, max: 8 },  // 10 + 1d8
+    attackBoost: { min: 1, max: 10 }, // 10 + 1d10
     damage:      { min: 1, max: 6 },  // 1d6
 
     specialActions: ALL_SPECIALS.map(s => ({
