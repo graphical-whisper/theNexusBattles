@@ -97,13 +97,13 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 /** ---------- Héroe de pruebas con TODAS las skills ---------- */
 const HERO_STATS = {
   hero: {
-    heroType: "WEAPONS_PAL",
+    heroType: "POISON_ROGUE",
     level: 1,
     power: 8 * 1,
-    health: 44 * 1,
-    defense: 11 * 1,
+    health: 36 * 1,
+    defense: 8 * 1,
     attack: 10 * 1,
-    attackBoost: { min: 1, max: 6 },  // 10 + 1d6
+    attackBoost: { min: 1, max: 10 }, // 10 + 1d10
     damage:      { min: 1, max: 6 },  // 1d6
 
 
