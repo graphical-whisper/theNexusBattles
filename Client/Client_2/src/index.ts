@@ -84,15 +84,16 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 
 /** ---------- Héroe pruebas ---------- */
 const HERO_STATS = {
-  POISON_ROGUE: {
-    heroType: "POISON_ROGUE",
+  hero: {
+    heroType: "WEAPONS_PAL",
     level: 1,
     power: 8 * 1,
-    health: 36 * 1,
-    defense: 8 * 1,
+    health: 44 * 1,
+    defense: 11 * 1,
     attack: 10 * 1,
-    attackBoost: { min: 1, max: 10 }, // 10 + 1d10
+    attackBoost: { min: 1, max: 6 },  // 10 + 1d6
     damage:      { min: 1, max: 6 },  // 1d6
+
 
     specialActions: ALL_SPECIALS.map(s => ({
       name: s.name,
