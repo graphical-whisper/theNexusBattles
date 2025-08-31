@@ -6,19 +6,15 @@ import { SPECIAL_KIND, MASTER_KIND, ActionGroup } from "./ai_action_catalog";
 type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
 type HeroState = {
+  // El server puede enviar type/heroType como número del enum o como string
   type?: string | number;
   heroType?: string | number;
-  level: number;
-  health: number;
-  power: number;
-  attack: number;
-  defense: number;
+  level: number; health: number; power: number;
+  attack: number; defense: number;
   damage?: { min: number; max: number };
   attackBoost?: { min: number; max: number };
   randomEffects?: { randomEffectType: string; percentage: number }[];
-  specialActions?: { name: string; powerCost: number; isAvailable: boolean }[]; // Agregar aquí
 };
-
 
 type PlayerNode = {
   username?: string; id?: string; playerId?: string;
@@ -143,7 +139,7 @@ let pending: null | {
   actorBefore: ReturnType<typeof buildSideFeatures>;
   enemyBefore: ReturnType<typeof buildSideFeatures>;
   maskStats: ReturnType<typeof buildMask>;
-  chosen: { kind: ActionType; skillId?: string; group: ActionGroup; damage: number; heal: number; powerCost: number };
+  chosen: { kind: ActionType; skillId?: string; group: ActionGroup };
 } = null;
 
 // --- API expuesta ---
@@ -175,7 +171,7 @@ export function recordDecision(
   turnIndex: number,
   payloadBefore: any,
   actorId: string,
-  chosen: { kind: ActionType; skillId?: string, damage?: number, heal?: number, powerCost?: number }
+  chosen: { kind: ActionType; skillId?: string }
 ) {
   const battle = payloadBefore?.battle ?? payloadBefore;
   const ps: PlayerNode[] = battle?.players ?? battle?.teams?.flatMap((t: any) => t.players) ?? [];
@@ -196,22 +192,14 @@ export function recordDecision(
         ? (SPECIAL_KIND[chosen.skillId || ""] || "offense")
         : (MASTER_KIND[chosen.skillId || ""] || "support"));
 
-  // Ahora simplemente usamos los valores que ya fueron calculados previamente
-  const damage = chosen.damage ?? 0; // Tomamos el daño calculado por el cliente
-  const heal = chosen.heal ?? 0;      // Tomamos la curación calculada por el cliente
-  const powerCost = chosen.powerCost ?? 0; // Tomamos el costo de poder calculado por el cliente
-
-  // Registrar los valores sin calcularlos nuevamente
   pending = {
     matchId, roomId, turnIndex,
     actorId, enemyId: idOf(foe),
     actorBefore, enemyBefore,
     maskStats: mask,
-    chosen: { ...chosen, group: chosen_group, damage, heal, powerCost }
+    chosen: { ...chosen, group: chosen_group }
   };
 }
-
-
 
 export function recordOutcome(payloadAfter: any) {
   if (!pending) return;
@@ -233,7 +221,6 @@ export function recordOutcome(payloadAfter: any) {
     dmg_to_enemy > 0 ? "DAMAGE" :
       heal_to_self > 0 ? "HEAL" : "NONE";
 
-  // Ahora registramos directamente los valores calculados (daño, curación) que ya están en `pending`
   const row = {
     ts,
     match_id: pending.matchId,
@@ -242,18 +229,23 @@ export function recordOutcome(payloadAfter: any) {
     actor_id: pending.actorId,
     enemy_id: pending.enemyId,
 
+    // Tipos de héroe explícitos (fáciles de filtrar)
     actor_hero_type: pending.actorBefore.type,
-    enemy_hero_type: pending.actorBefore.type,
+    enemy_hero_type: pending.enemyBefore.type,
 
+    // Estado pre-turno (ya incluye type y hp_pct normalizados)
     actor: pending.actorBefore,
     enemy: pending.enemyBefore,
 
+    // máscara de validez (cuántas acciones disponibles por grupo)
     ...pending.maskStats,
 
+    // Decisión tomada
     chosen_action_kind: pending.chosen.kind,
     chosen_skill_id: pending.chosen.skillId || null,
     chosen_action_group: pending.chosen.group,
 
+    // Outcome observado
     dmg_to_enemy,
     heal_to_self,
     effect_applied,
@@ -267,5 +259,3 @@ export function recordOutcome(payloadAfter: any) {
   STREAM.write(JSON.stringify(row) + "\n");
   pending = null;
 }
-
-

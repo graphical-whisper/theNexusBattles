@@ -1,19 +1,22 @@
 import axios from "axios";
 import { io } from "socket.io-client";
-// Importar las funciones necesarias
+import { Readline } from "./readline";
+// NUEVO:
 import { startMatchIfEligible, recordDecision, recordOutcome } from "./dataset_logger";
+
+
 
 type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
 const API_URL = "http://localhost:3000";
 const SOCKET_URL = "http://localhost:3000";
-const ROOM_ID = "ZZZ000b";
+const ROOM_ID = "ZZZ000";
 const MY_ID = "playerB";
-let lastPayload: any = null; // Asegúrate de que esta variable sea usada
+let lastPayload: any = null;
 let turnIndex = 0;
 const MATCH_ID = `${ROOM_ID}-${Date.now()}`;
 
-// Crear la conexión con Socket.IO
+const readline = new Readline();
 const socket = io(SOCKET_URL);
 
 /** ---------- Specials ---------- */
@@ -82,14 +85,15 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 /** ---------- Héroe pruebas ---------- */
 const HERO_STATS = {
   hero: {
-    heroType: "ICE_MAGE",
+    heroType: "POISON_ROGUE",
     level: 1,
-    power: 10 * 1,
-    health: 40 * 1,
-    defense: 10 * 1,
+    power: 8 * 1,
+    health: 36 * 1,
+    defense: 8 * 1,
     attack: 10 * 1,
-    attackBoost: { min: 1, max: 8 },  // 10 + 1d8
+    attackBoost: { min: 1, max: 10 }, // 10 + 1d10
     damage:      { min: 1, max: 6 },  // 1d6
+
 
     specialActions: ALL_SPECIALS.map(s => ({
       name: s.name,
@@ -139,6 +143,12 @@ function resolveTargetId(raw: string): string {
   const hitCI = turns.find(u => u.toLowerCase() === input.toLowerCase());
   return hitCI || otherPlayerId();
 }
+function renderSpecialsMenu() {
+  return ALL_SPECIALS.map((s, i) => `${i + 1}. ${s.id}  (${s.name})`).join("\n");
+}
+function renderMastersMenu() {
+  return ALL_MASTERS.map((m, i) => `${i + 1}. ${m.id}  (${m.name})`).join("\n");
+}
 
 /** ---------- Emit ---------- */
 function sendBasic(targetId: string) {
@@ -158,61 +168,38 @@ function sendMaster(input: string, targetId: string) {
   socket.emit("submitAction", { roomId: ROOM_ID, action });
 }
 
+/** ---------- Prompt ---------- */
 async function promptAndSend() {
   if (finished || currentTurn !== MY_ID) return;
 
   console.log(`\n>>> YOUR TURN (${MY_ID})`);
-  const target = resolveTargetId(otherPlayerId());  // Target opponent automatically
+  const kind = (await readline.pregunta('Action ("BASIC" | "SPECIAL" | "MASTER"): ')).trim().toUpperCase();
+  const target = resolveTargetId(await readline.pregunta(`Target (default: ${otherPlayerId()}): `));
 
-  const actions = [
-    { type: "SPECIAL_SKILL" as ActionType, skillId: "GOLPE_ESCUDO" }, // Habilidad 1
-    { type: "SPECIAL_SKILL" as ActionType, skillId: "MANO_PIEDRA" },  // Habilidad 2
-  ];
+  if (kind === "SPECIAL") {
+    console.log("\n== SPECIALS ==\n" + renderSpecialsMenu() + "\n");
+    const pick = (await readline.pregunta("Pick (number | name | ID): ")).trim();
+    const n = parseInt(pick, 10);
+    const chosen = (!Number.isNaN(n) && n >= 1 && n <= ALL_SPECIALS.length) ? ALL_SPECIALS[n - 1]!.id : pick;
 
-  // Bucle hasta que la batalla termine
-  for (let i = 0; i < actions.length; i++) {
-    if (finished) {
-      console.log("Batalla terminada, no se enviarán más habilidades.");
-      break;  // Salimos del bucle si la batalla ya ha terminado
-    }
+    // NUEVO: registrar decisión
+    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "SPECIAL_SKILL", skillId: toServerSkillId(chosen, "SPECIAL") });
 
-    const action = actions[i];
-    if (!action || !action.skillId) continue;
+    sendSpecial(chosen, target);
+  } else if (kind === "MASTER") {
+    console.log("\n== MASTERS ==\n" + renderMastersMenu() + "\n");
+    const pick = (await readline.pregunta("Pick (number | name | ID): ")).trim();
+    const n = parseInt(pick, 10);
+    const chosen = (!Number.isNaN(n) && n >= 1 && n <= ALL_MASTERS.length) ? ALL_MASTERS[n - 1]!.id : pick;
 
-    const powerCost = (HERO_STATS.hero?.specialActions?.find(s => s.name === action.skillId)?.powerCost) ?? 0;
+    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "MASTER_SKILL", skillId: toServerSkillId(chosen, "MASTER") });
 
-    // Ejecutar habilidad o ataque básico si se tiene suficiente poder
-    if (HERO_STATS.hero && HERO_STATS.hero.power >= powerCost) {
-      console.log(`Ejecutando habilidad: ${action.skillId}`);
-      HERO_STATS.hero.power -= powerCost;
-
-      if (action.type === "SPECIAL_SKILL") {
-        sendSpecial(action.skillId, target);
-      } else if (action.type === "MASTER_SKILL") {
-        sendMaster(action.skillId, target);
-      } else {
-        sendBasic(target);
-      }
-
-    } else {
-      // Si no hay suficiente poder, ejecuta un ataque básico
-      console.log("No hay suficiente poder, ejecutando ataque básico.");
-      sendBasic(target);
-    }
-
-    // Espera siempre 5 segundos entre habilidades
-    console.log(`Esperando 5 segundos antes de la siguiente habilidad...`);
-    await new Promise(resolve => setTimeout(resolve, 5000));  // Espera 5 segundos
-
-    // Si ya hemos llegado al final de las habilidades, volver al principio
-    if (i + 1 >= actions.length) {
-      console.log("Se acabaron las habilidades. Volviendo al inicio.");
-      i = -1;  // Esto hará que vuelva a la primera habilidad
-    }
+    sendMaster(chosen, target);
+  } else {
+    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "BASIC_ATTACK" });
+    sendBasic(target);
   }
-  console.log("Batalla terminada, no se enviarán más habilidades.");
 }
-
 
 /** ---------- Sockets ---------- */
 function extractBattle(payload: any) {
@@ -229,7 +216,6 @@ function printQuickPlayers(payload: any) {
     console.log(`- ${p.username} :: HP=${h.health} POW=${h.power} ATK=${h.attack} DEF=${h.defense} POWER=${h.power}`);
   }
 }
-
 async function printRaw(label: string, payload: any) {
   console.log(`\n--- RAW ${label} :: actionResolved payload ---`);
   console.dir(payload, { depth: null });
@@ -245,40 +231,66 @@ function wireSocket() {
     socket.emit("playerReady", { roomId: ROOM_ID, playerId: MY_ID, team: "B" });
   });
 
+  /*
   socket.on("battleStarted", async (data: any) => {
     socket.emit("joinBattle", { roomId: ROOM_ID, playerId: MY_ID });
     console.log("Battle started:", data?.turns);
     turns = data?.turns || [];
     currentTurn = turns[0] || null;
     finished = false;
-    lastPayload = data;
-    const ok = startMatchIfEligible(ROOM_ID, MATCH_ID, data, MY_ID);
-    if (!ok.ok) console.log("Dataset: partida no elegible:", ok.reason);
     await printRaw("battleStarted", data);
     if (currentTurn === MY_ID) promptAndSend();
   });
-
+  */
+  socket.on("battleStarted", async (data: any) => {
+    socket.emit("joinBattle", { roomId: ROOM_ID, playerId: MY_ID });
+    console.log("Battle started:", data?.turns);
+    turns = data?.turns || [];
+    currentTurn = turns[0] || null;
+    finished = false;
+    //agregado
+    lastPayload = data;
+      const ok = startMatchIfEligible(ROOM_ID, MATCH_ID, data, MY_ID);
+  if (!ok.ok) console.log("Dataset: partida no elegible:", ok.reason);
+    await printRaw("battleStarted", data);
+    if (currentTurn === MY_ID) promptAndSend();
+  });
+/*
   socket.on("actionResolved", async (data: any) => {
-    console.log("\n=== Action resolved ===");
-    await printRaw("actionResolved", data);
+    console.log("\n=== Action resolved (B) ===");
+    await printRaw("actionResolved(B)", data);
 
-    // Registrar el resultado de la acción si es necesario
-    recordOutcome(data);
-
-    // fin de batalla o siguiente turno
     if (data?.state === "FINISHED" || data?.winner || data?.winningTeam) {
       finished = true;
       console.log("⚑ Battle finished.", data?.winner ? `Winner: ${data.winner}` : "");
       return;
     }
-    // avanza turno (si el siguiente es mío, aumenta índice local)
-    const before = currentTurn;
     currentTurn = data?.nextTurnPlayer || currentTurn;
-    lastPayload = data; // Actualización de lastPayload
-    if (currentTurn === MY_ID && before !== MY_ID) turnIndex += 1;
-
-    if (currentTurn === MY_ID) promptAndSend();
+    promptAndSend();
   });
+  */
+ socket.on("actionResolved", async (data: any) => {
+  console.log("\n=== Action resolved ===");
+  await printRaw("actionResolved", data);
+
+  // NUEVO: outcome para la decisión previamente registrada (si la hubo)
+  recordOutcome(data);
+
+  // fin de batalla o siguiente turno
+  if (data?.state === "FINISHED" || data?.winner || data?.winningTeam) {
+    finished = true;
+    console.log("⚑ Battle finished.", data?.winner ? `Winner: ${data.winner}` : "");
+    return;
+  }
+  // avanza turno (si el siguiente es mío, aumenta índice local)
+  const before = currentTurn;
+  currentTurn = data?.nextTurnPlayer || currentTurn;
+  lastPayload = data; // NUEVO
+  if (currentTurn === MY_ID && before !== MY_ID) turnIndex += 1;
+
+  if (currentTurn === MY_ID) promptAndSend();
+});
+
 
   socket.on("battleEnded", (data: any) => { finished = true; console.log("⚑ battleEnded:", data); });
   socket.on("error", (err) => console.error("Socket error:", err));
@@ -286,5 +298,6 @@ function wireSocket() {
 
 // --- Run ---
 (async () => {
+  // A ya creó la sala
   wireSocket();
 })();
