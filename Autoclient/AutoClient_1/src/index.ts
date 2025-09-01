@@ -15,14 +15,11 @@ const EXTRA_DELAY_MS = 5000;                 // Espera obligatoria
 
 // ===== Patrón cíclico =====
 // Tokens válidos: "BASIC", "SPECIAL:<ID o nombre>", "MASTER:<ID o nombre>"
-// Ejemplos de patrones:
-//   1 habilidad  -> ["SPECIAL:GOLPE_ESCUDO"]
-//   2 habilidades -> ["SPECIAL:GOLPE_ESCUDO","SPECIAL:EMBATE_SANGRIENTO"]
-//   3 pasos       -> ["SPECIAL:GOLPE_ESCUDO","MASTER:MASTER.TANK_GOLPE_DEFENSA","BASIC"]
+
 const PATTERN: string[] = [
-  "SPECIAL:GOLPE_ESCUDO",
-//  "SPECIAL:EMBATE_SANGRIENTO",
-//  "BASIC",
+  "SPECIAL:GOLPE_TORMENTA",
+  //"MASTER:MASTER.ICE_FRIO_CONCENTRADO",
+  //"BASIC",
 ];
 
 // ===== Listas de habilidades (IDs y nombres amigables) =====
