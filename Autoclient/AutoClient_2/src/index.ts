@@ -1,53 +1,64 @@
-// index_client2_auto.ts (cliente 2 - automático con fallback)
+// index_client2_auto.ts (cliente 2 - automático)
 import axios from "axios";
 import { io } from "socket.io-client";
 import { startMatchIfEligible, recordDecision, recordOutcome } from "./dataset_logger";
 
 type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
+// ===== Config =====
 const API_URL     = "http://localhost:3000";
 const SOCKET_URL  = "http://localhost:3000";
 const ROOM_ID     = "ZZZ000";
-const MY_ID       = "playerB";     // Cliente 2
+const MY_ID       = "playerB";           // Cliente 2
 const MY_TEAM     = "B";
 const MATCH_ID    = `${ROOM_ID}-${Date.now()}`;
-const EXTRA_DELAY_MS = 5000;
+const EXTRA_DELAY_MS = 1000;             // Espera obligatoria
 
-// ===== Patrón cíclico (edita libremente) =====
+// ===== Patrón cíclico del Cliente 2 =====
 // Tokens válidos: "BASIC", "SPECIAL:<ID o nombre>", "MASTER:<ID o nombre>"
+// Usa un patrón distinto al del cliente 1 para enriquecer el dataset:
 const PATTERN: string[] = [
-  "SPECIAL:GOLPE_TORMENTA",
+  "SPECIAL:CORTADA",
   //"MASTER:MASTER.ICE_FRIO_CONCENTRADO",
- // "BASIC",
+  "BASIC",
 ];
 
-// ===== Catálogo local de IDs/nombres  =====
+// ===== Habilidades disponibles (IDs y nombres) =====
 const ALL_SPECIALS: { id: string; name: string }[] = [
+  // Tank
   { id: "GOLPE_ESCUDO", name: "Golpe con escudo" },
   { id: "MANO_PIEDRA", name: "Mano de piedra" },
   { id: "DEFENSA_FEROZ", name: "Defensa feroz" },
+  // Warrior Arms
   { id: "EMBATE_SANGRIENTO", name: "Embate sangriento" },
   { id: "LANZA_DIOSES", name: "Lanza de los dioses" },
   { id: "GOLPE_TORMENTA", name: "Golpe de tormenta" },
+  // Mage Fire
   { id: "MISILES_MAGMA", name: "Misiles de magma" },
   { id: "VULCANO", name: "Vulcano" },
   { id: "PARED_FUEGO", name: "Pared de fuego" },
+  // Mage Ice
   { id: "LLUVIA_HIELO", name: "Lluvia de hielo" },
   { id: "CONO_HIELO", name: "Cono de hielo" },
   { id: "BOLA_HIELO", name: "Bola de hielo" },
+  // Rogue Poison
   { id: "FLOR_LOTO", name: "Flor de loto" },
   { id: "AGONIA", name: "Agonía" },
   { id: "PIQUETE", name: "Piquete" },
+  // Rogue Machete
   { id: "CORTADA", name: "Cortada" },
   { id: "MACHETAZO", name: "Machetazo" },
   { id: "PLANAZO", name: "Planazo" },
+  // Shaman
   { id: "TOQUE_VIDA", name: "Toque de la vida" },
   { id: "VINCULO_NATURAL", name: "Vínculo natural" },
   { id: "CANTO_BOSQUE", name: "Canto del bosque" },
+  // Medic
   { id: "CURACION_DIRECTA", name: "Curación directa" },
   { id: "NEUTRALIZACION_EFECTOS", name: "Neutralización de efectos" },
   { id: "REANIMACION", name: "Reanimación" },
 ];
+
 const ALL_MASTERS: { id: string; name: string }[] = [
   { id: "MASTER.TANK_GOLPE_DEFENSA", name: "Golpe de Defensa" },
   { id: "MASTER.ARMS_SEGUNDO_IMPULSO", name: "Segundo Impulso" },
@@ -59,6 +70,7 @@ const ALL_MASTERS: { id: string; name: string }[] = [
   { id: "MASTER.MEDIC_REANIMADOR_3000", name: "Reanimador 3000" },
 ];
 
+// ===== Utilidades nombre→ID (igual que en tus clientes) =====
 const SPECIAL_NAME_TO_ID = Object.fromEntries(ALL_SPECIALS.map(s => [normalizeKey(s.name), s.id]));
 const MASTER_NAME_TO_ID  = Object.fromEntries(ALL_MASTERS.map(m => [normalizeKey(m.name), m.id]));
 const VALID_SPECIAL_IDS  = new Set(ALL_SPECIALS.map(s => s.id));
@@ -82,17 +94,18 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
   }
 }
 
-// ===== Hero de prueba (igual a cliente 1), con todas las skills disponibles por defecto =====
+// ===== Héroe (mismo esquema que el cliente 1) =====
 const HERO_STATS = {
-  hero: {
-    heroType: "POISON_ROGUE",
-    level: 1,
-    power: 8 * 1,
-    health: 36 * 1,
-    defense: 8 * 1,
-    attack: 10 * 1,
+    hero: {
+    heroType: "MACHETE_ROGUE",
+    level: 2,
+    power: 8 * 2,
+    health: 36 * 2,
+    defense: 8 * 2,
+    attack: 10 * 2,
     attackBoost: { min: 1, max: 10 },
-    damage:      { min: 1, max: 6 },
+    damage: { min: 1, max: 8 },
+
     specialActions: ALL_SPECIALS.map(s => ({
       name: s.name, actionType: "ATTACK", powerCost: 1, cooldown: 0, isAvailable: true, effect: [],
     })),
@@ -123,41 +136,8 @@ let turnIndex = 0;
 let patternIdx = 0;
 
 const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
+const extractBattle = (payload: any) => payload?.battle ?? payload;
 const otherPlayerId = () => turns.find(u => u !== MY_ID) || "";
-
-// ===== Helpers: disponibilidad de skills desde el payload =====
-function getMySides(payload: any) {
-  const battle = payload?.battle ?? payload;
-  const players = battle?.players ?? battle?.teams?.flatMap((t: any) => t.players) ?? [];
-  const me = players.find((p: any) => (p?.username || p?.id || p?.playerId) === MY_ID);
-  return {
-    hero: me?.heroStats?.hero,
-    equipped: me?.heroStats?.equipped,
-  } as { hero?: any; equipped?: any };
-}
-
-function canUseSpecial(skillIdOrName: string, payload: any): boolean {
-  const { hero } = getMySides(payload);
-  if (!hero) return false;
-  const specials = (hero as any).specialActions ?? [];
-  const want = toServerSkillId(skillIdOrName, "SPECIAL");
-  return specials.some((s: any) => {
-    const id = (s.id || s.name);
-    const cost = s.powerCost ?? 0;
-    const ok = !!s?.isAvailable && (s?.cooldown ?? 0) === 0 && (hero.power ?? 0) >= cost;
-    return ok && (id === want);
-  });
-}
-
-function canUseMaster(skillIdOrName: string, payload: any): boolean {
-  const { hero, equipped } = getMySides(payload);
-  if (!hero) return false;
-  const masters = (equipped?.epicAbilites ?? []).map((m: any) => ({
-    id: m.id || m.name, cooldown: m.cooldown ?? 0, isAvailable: !!m.isAvailable
-  }));
-  const want = toServerSkillId(skillIdOrName, "MASTER");
-  return masters.some((m: any) => m.isAvailable && m.cooldown === 0 && m.id === want);
-}
 
 // ===== Emit =====
 function sendBasic(targetId: string) {
@@ -177,36 +157,31 @@ function sendMaster(input: string, targetId: string) {
   socket.emit("submitAction", { roomId: ROOM_ID, action });
 }
 
-// ===== Turno automático con fallback =====
+// ===== Turno automático =====
 async function actAutomatically() {
   if (finished || currentTurn !== MY_ID) return;
+
+  // Espera adicional obligatoria
   await delay(EXTRA_DELAY_MS);
 
   const targetId = otherPlayerId();
-  const tries = Math.max(1, PATTERN.length);
-  let chosenKind: ActionType = "BASIC_ATTACK";
+  const token = (PATTERN[patternIdx % PATTERN.length] ?? "BASIC").trim(); // seguro aunque el array quede vacío
+  patternIdx++;
+
+  const upper = token.toUpperCase();
+  let chosenKind: ActionType;
   let chosenSkillId: string | undefined;
 
-  for (let k = 0; k < tries; k++) {
-    const token = (PATTERN[patternIdx % PATTERN.length] ?? "BASIC").trim();
-    patternIdx++;
-
-    const upper = token.toUpperCase();
-    if (upper === "BASIC") {
-      chosenKind = "BASIC_ATTACK";
-      break;
-    } else if (upper.startsWith("SPECIAL:")) {
-      const raw = token.split(":")[1] || "";
-      if (raw && canUseSpecial(raw, lastPayload)) {
-        chosenKind = "SPECIAL_SKILL"; chosenSkillId = raw; break;
-      }
-    } else if (upper.startsWith("MASTER:")) {
-      const raw = token.split(":")[1] || "";
-      if (raw && canUseMaster(raw, lastPayload)) {
-        chosenKind = "MASTER_SKILL"; chosenSkillId = raw; break;
-      }
-    }
-    // si no es usable, intenta el siguiente token del patrón
+  if (upper === "BASIC") {
+    chosenKind = "BASIC_ATTACK";
+  } else if (upper.startsWith("SPECIAL:")) {
+    chosenKind = "SPECIAL_SKILL";
+    chosenSkillId = token.split(":")[1] || "";
+  } else if (upper.startsWith("MASTER:")) {
+    chosenKind = "MASTER_SKILL";
+    chosenSkillId = token.split(":")[1] || "";
+  } else {
+    chosenKind = "BASIC_ATTACK";
   }
 
   // Registrar + enviar
@@ -226,11 +201,11 @@ async function actAutomatically() {
   }
 }
 
-// ===== Logs / sockets =====
-function extractBattle(payload: any) { return payload?.battle ?? payload; }
+// ===== Logs útiles =====
 function printQuickPlayers(payload: any) {
   const battle = extractBattle(payload);
-  const players = battle?.players ?? battle?.teams?.flatMap((t: any) => t.players) ?? [];
+  if (!battle?.players && !battle?.teams) return;
+  const players = battle.players ?? battle.teams?.flatMap((t: any) => t.players) ?? [];
   console.log("=== Players / Quick Stats ===");
   for (const p of players) {
     const h = p?.heroStats?.hero; if (!h) continue;
@@ -243,9 +218,11 @@ async function printRaw(label: string, payload: any) {
   printQuickPlayers(payload);
 }
 
+// ===== Sockets =====
 function wireSocket() {
   socket.on("connect", async () => {
     console.log("Socket connected:", socket.id);
+    // El cliente 1 suele crear la sala; aquí solo nos unimos y marcamos ready
     socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 1 } });
     await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 1, heroStats: HERO_STATS }).catch(() => {});
     socket.emit("setHeroStats", { roomId: ROOM_ID, playerId: MY_ID, stats: HERO_STATS });
@@ -271,14 +248,17 @@ function wireSocket() {
     console.log("\n=== Action resolved ===");
     await printRaw("actionResolved", data);
 
-    recordOutcome(data); // outcome de la decisión previa
+    // Outcome para la decisión previa
+    recordOutcome(data);
 
+    // Fin de batalla
     if (data?.state === "FINISHED" || data?.winner || data?.winningTeam) {
       finished = true;
       console.log("⚑ Battle finished.", data?.winner ? `Winner: ${data.winner}` : "");
       return;
     }
 
+    // Avanzar turno
     const before = currentTurn;
     currentTurn = data?.nextTurnPlayer || currentTurn;
     lastPayload = data;
@@ -291,4 +271,5 @@ function wireSocket() {
   socket.on("error", (err) => console.error("Socket error:", err));
 }
 
+// --- Run ---
 wireSocket();

@@ -11,15 +11,15 @@ const ROOM_ID     = "ZZZ000";
 const MY_ID       = "playerA";               // Cliente 1
 const MY_TEAM     = "A";
 const MATCH_ID    = `${ROOM_ID}-${Date.now()}`;
-const EXTRA_DELAY_MS = 5000;                 // Espera obligatoria
+const EXTRA_DELAY_MS = 1000;                 // Espera obligatoria
 
 // ===== Patrón cíclico =====
 // Tokens válidos: "BASIC", "SPECIAL:<ID o nombre>", "MASTER:<ID o nombre>"
 
 const PATTERN: string[] = [
-  "SPECIAL:GOLPE_TORMENTA",
+  "SPECIAL:CORTADA",
   //"MASTER:MASTER.ICE_FRIO_CONCENTRADO",
-  //"BASIC",
+  "BASIC",
 ];
 
 // ===== Listas de habilidades (IDs y nombres amigables) =====
@@ -96,14 +96,16 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 // ===== Héroe (mismo esquema del cliente 1) =====
 const HERO_STATS = {
   hero: {
-    heroType: "POISON_ROGUE",
-    level: 1,
-    power: 8 * 1,
-    health: 36 * 1,
-    defense: 8 * 1,
-    attack: 10 * 1,
+    heroType: "MACHETE_ROGUE",
+    level: 2,
+    power: 8 * 2,
+    health: 36 * 2,
+    defense: 8 * 2,
+    attack: 10 * 2,
     attackBoost: { min: 1, max: 10 },
-    damage:      { min: 1, max: 6 },
+    damage: { min: 1, max: 8 },
+
+
     specialActions: ALL_SPECIALS.map(s => ({
       name: s.name,
       actionType: "ATTACK",
