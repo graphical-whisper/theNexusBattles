@@ -1,371 +1,332 @@
-// aiclient/index.ts (AI client basado en cliente 2: NO crea sala)
-// Instalar npm i axios socket.io-client @tensorflow/tfjs-node
+// AIClient(2)/src/index.ts — IA vs “cliente 1” con consulta de roster por socket (sin GET 404)
+// Reqs: npm i socket.io-client axios
+// Node >= 18 (fetch nativo). Si Node < 18: npm i undici y usa undici.fetch
+
 import axios from "axios";
-import { io } from "socket.io-client";
-import * as tf from "@tensorflow/tfjs-node";
-import * as fs from "fs";
-import * as path from "path";
+import { io, Socket } from "socket.io-client";
 
-// Reutiliza tu logger y catálogo 
-import { startMatchIfEligible, recordDecision, recordOutcome } from "../dataset_logger";
-import { SPECIAL_KIND, MASTER_KIND } from "../ai_action_catalog";
+// ====== ENV / Config ======
+const SOCKET_URL = process.env["SOCKET_URL"] || "http://localhost:3000";
+const API_URL    = process.env["API_URL"]    || "http://localhost:3000";
+const AI_URL     = process.env["AI_URL"]     || "http://127.0.0.1:8000";
 
-type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
+const ROOM_ID    = process.env["ROOM_ID"]    || "ZZZ000";
+const MY_ID      = process.env["MY_ID"]      || "playerB";
+const TEAM       = process.env["TEAM"]       || "B";
 
-// ===== Config =====
-const API_URL     = process.env['API_URL']     || "http://localhost:3000";
-const SOCKET_URL  = process.env['SOCKET_URL']  || "http://localhost:3000";
-const ROOM_ID     = process.env['ROOM_ID']     || "ZZZ000";
-const MY_ID       = process.env['MY_ID']       || "playerB";
-const MY_TEAM     = process.env['MY_TEAM']     || "B";
-const EXTRA_DELAY_MS = Number(process.env['EXTRA_DELAY_MS'] || 5000);
+// Héroe configurable (por defecto Rogue Poison lvl 2)
+const HERO_TYPE  = (process.env["HERO_TYPE"]  || "ROGUE_POISON").toUpperCase();
+const HERO_LEVEL = Number(process.env["HERO_LEVEL"] || 2);
+const HERO_ATK   = Number(process.env["HERO_ATK"]   || 12);
+const HERO_DEF   = Number(process.env["HERO_DEF"]   || 10);
+const HERO_HP    = Number(process.env["HERO_HP"]    || 80);
+const HERO_PWR   = Number(process.env["HERO_PWR"]   || 10);
 
-const DATA_DIR    = process.env['DATA_DIR']    || path.resolve("data");
-const MERGED_FILE = process.env['MERGED_FILE'] || path.join(DATA_DIR, "merged_turns.ndjson"); 
-const MODEL_DIR   = process.env['MODEL_DIR']   || path.resolve("models/policy_ai");
+// ====== Catálogo slots → skillId del juego ======
+type Slot = "SPECIAL_SKILL_1" | "SPECIAL_SKILL_2" | "SPECIAL_SKILL_3";
+const SLOT_TO_SKILL: Record<string, Record<Slot, string>> = {
+  TANK:          { SPECIAL_SKILL_1:"GOLPE_ESCUDO",      SPECIAL_SKILL_2:"MANO_PIEDRA",   SPECIAL_SKILL_3:"DEFENSA_FEROZ" },
+  WARRIOR_ARMS:  { SPECIAL_SKILL_1:"EMBATE_SANGRIENTO", SPECIAL_SKILL_2:"LANZA_DIOSES",  SPECIAL_SKILL_3:"GOLPE_TORMENTA" },
+  MAGE_FIRE:     { SPECIAL_SKILL_1:"MISILES_MAGMA",     SPECIAL_SKILL_2:"VULCANO",       SPECIAL_SKILL_3:"PARED_FUEGO" },
+  MAGE_ICE:      { SPECIAL_SKILL_1:"LLUVIA_HIELO",      SPECIAL_SKILL_2:"CONO_HIELO",    SPECIAL_SKILL_3:"BOLA_HIELO" },
+  ROGUE_POISON:  { SPECIAL_SKILL_1:"FLOR_LOTO",         SPECIAL_SKILL_2:"AGONIA",        SPECIAL_SKILL_3:"PIQUETE" },
+  ROGUE_MACHETE: { SPECIAL_SKILL_1:"CORTADA",           SPECIAL_SKILL_2:"MACHETAZO",     SPECIAL_SKILL_3:"PLANAZO" },
+};
+function heroKeyForAI(ht: string|number) {
+  const s = String(ht).toUpperCase();
+  if (s === "POISON_ROGUE")  return "ROGUE_POISON";
+  if (s === "MACHETE_ROGUE") return "ROGUE_MACHETE";
+  return s;
+}
 
-const socket = io(SOCKET_URL);
+// ====== Tipos IA ======
+type ActionKind = "BASIC_ATTACK" | "SPECIAL_SKILL_1" | "SPECIAL_SKILL_2" | "SPECIAL_SKILL_3";
+type TargetKind = "ENEMY" | "SELF";
+interface ActorState { heroType: string|number; level:number; power:number; attack?:number; defense?:number; health?:number; }
+interface EnemyState { health?:number; defense?:number; }
+interface PredictRequest { actor:ActorState; enemy:EnemyState; forbidden_actions?: ActionKind[]; }
+interface PredictResponse { kind:ActionKind; skillId?:number|null; target:TargetKind; reason:string; }
+
+const fetchFn: typeof fetch = (globalThis.fetch as any);
+
+// ====== Estado de sala/combate ======
+const socket: Socket = io(SOCKET_URL, { transports:["websocket"], reconnection:true, timeout:5000 });
+const roster = new Set<string>();
+let weReady = false;
+let oppReady = false;
+let battleJoined = false;
 let turns: string[] = [];
 let currentTurn: string | null = null;
-let finished = false;
-let lastPayload: any = null;
-let turnIndex = 0;
-const MATCH_ID = `${ROOM_ID}-${Date.now()}`;
 
-const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
-const otherPlayerId = () => turns.find(u => u !== MY_ID) || "";
+// Stats del héroe local (mismo shape del server)
+const HERO_STATS = {
+  hero: {
+    heroType: HERO_TYPE,
+    level: HERO_LEVEL,
+    power: HERO_PWR,
+    health: HERO_HP,
+    defense: HERO_DEF,
+    attack: HERO_ATK,
+    specialActions: [],
+    randomEffects: [],
+  },
+  equipped: { items:[], armors:[], weapons:[], epicAbilites:[] }
+};
 
-// ===== Habilidades conocidas =====
-const ALL_SPECIALS = [
-  "GOLPE_ESCUDO","MANO_PIEDRA","DEFENSA_FEROZ",
-  "EMBATE_SANGRIENTO","LANZA_DIOSES","GOLPE_TORMENTA",
-  "MISILES_MAGMA","VULCANO","PARED_FUEGO",
-  "LLUVIA_HIELO","CONO_HIELO","BOLA_HIELO",
-  "FLOR_LOTO","AGONIA","PIQUETE",
-  "CORTADA","MACHETAZO","PLANAZO",
-  "TOQUE_VIDA","VINCULO_NATURAL","CANTO_BOSQUE",
-  "CURACION_DIRECTA","NEUTRALIZACION_EFECTOS","REANIMACION",
-] as const;
-
-const ALL_MASTERS = [
-  "MASTER.TANK_GOLPE_DEFENSA","MASTER.ARMS_SEGUNDO_IMPULSO","MASTER.FIRE_LUZ_CEGADORA",
-  "MASTER.ICE_FRIO_CONCENTRADO","MASTER.VENENO_TOMA_LLEVA","MASTER.MACHETE_INTIMIDACION_SANGRIENTA",
-  "MASTER.SHAMAN_TE_CHANGUA","MASTER.MEDIC_REANIMADOR_3000",
-] as const;
-
-const VALID_SPECIAL_IDS = new Set(ALL_SPECIALS);
-const VALID_MASTER_IDS  = new Set(ALL_MASTERS);
-function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
-  const raw = (input || "").trim().toUpperCase().replace(/\s+/g, "_");
-  return type === "SPECIAL" ? (VALID_SPECIAL_IDS.has(raw as any) ? raw : input)
-                            : (VALID_MASTER_IDS.has(raw as any)  ? raw : input);
+// ====== Utils ======
+const delay = (ms:number)=>new Promise(r=>setTimeout(r,ms));
+function jitter(min:number,max:number){ return min + Math.random()*(max-min); }
+function allowedActionsByLevel(level: number): ActionKind[] {
+  if (level <= 1) return ["BASIC_ATTACK"];
+  if (level <= 4) return ["BASIC_ATTACK", "SPECIAL_SKILL_1"];
+  if (level <= 7) return ["BASIC_ATTACK", "SPECIAL_SKILL_1", "SPECIAL_SKILL_2"];
+  return ["BASIC_ATTACK", "SPECIAL_SKILL_1", "SPECIAL_SKILL_2", "SPECIAL_SKILL_3"];
 }
-
-// ====== HERO TYPE one-hot + nivel (parches clave) ======
-const HERO_TYPE_LIST = [
-  "TANK","WEAPONS_PAL","FIRE_MAGE","ICE_MAGE",
-  "POISON_ROGUE","MACHETE_ROGUE","SHAMAN","MEDIC"
-] as const;
-type HeroTypeStr = typeof HERO_TYPE_LIST[number];
-
-function normalizeHeroTypeLive(raw: any): HeroTypeStr | "UNKNOWN" {
-  if (typeof raw === "number") return (HERO_TYPE_LIST[raw] ?? "UNKNOWN") as any;
-  if (typeof raw === "string") {
-    const s = raw.toUpperCase().trim();
-    return ((HERO_TYPE_LIST as readonly string[]).includes(s) ? s : "UNKNOWN") as any;
-  }
-  return "UNKNOWN";
+function localFallback(actor: ActorState): ActionKind {
+  const allowed = allowedActionsByLevel(actor.level);
+  return allowed.includes("SPECIAL_SKILL_1") ? "SPECIAL_SKILL_1" : "BASIC_ATTACK";
 }
-function oneHotType(t: string | undefined): number[] {
-  const v = (t ?? "UNKNOWN").toUpperCase();
-  return HERO_TYPE_LIST.map(x => (x === v ? 1 : 0));
+async function askAI(req: PredictRequest, timeoutMs=1800): Promise<PredictResponse|null> {
+  const ctrl = new AbortController(); const t = setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res = await fetchFn(`${AI_URL}/predict`, {
+      method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(req), signal:ctrl.signal
+    } as RequestInit);
+    if(!res.ok) return null;
+    return await res.json() as PredictResponse;
+  }catch{ return null; } finally{ clearTimeout(t); }
 }
+function getOpponent(): string { return turns.find(t => t !== MY_ID) || ""; }
 
-// ====== Features (alineadas con tu logger/NDJSON) ======
-type Sample = { x: number[]; y: number }; // y: 0 BASIC, 1 SPECIAL, 2 MASTER
-const LABEL_TO_Y: Record<string, number> = { BASIC_ATTACK:0, SPECIAL_SKILL:1, MASTER_SKILL:2 };
-const safeNum = (v: any, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
+// ====== Logger global ======
+socket.onAny((ev, ...args)=>{
+  try { console.log(`[ai] <= ${ev}`, JSON.stringify(args[0]??"", null, 2)); }
+  catch { console.log(`[ai] <= ${ev}`); }
+});
 
-// Dataset → vector con: tipos(8+8) + niveles(2) + base(13) = 31 features
-function featuresFromRow(r: any): number[] {
-  const actorTypeOH = oneHotType(r?.actor?.type);
-  const enemyTypeOH = oneHotType(r?.enemy?.type);
-  const actorLvl = Number(r?.actor?.level ?? 1);
-  const enemyLvl = Number(r?.enemy?.level ?? 1);
-
-  const base = [
-    safeNum(r?.actor?.hp_pct), safeNum(r?.actor?.power),
-    safeNum(r?.actor?.attack), safeNum(r?.actor?.defense),
-    safeNum(r?.enemy?.hp_pct), safeNum(r?.enemy?.attack),
-    safeNum(r?.enemy?.defense),
-    safeNum(r?.num_specials_valid_off),
-    safeNum(r?.num_specials_valid_def),
-    safeNum(r?.num_support_valid),
-    safeNum(r?.num_masters_valid_off),
-    safeNum(r?.num_masters_valid_def),
-    safeNum(r?.num_masters_support),
-  ];
-  return [...actorTypeOH, ...enemyTypeOH, actorLvl, enemyLvl, ...base];
-}
-
-// Live payload → MISMO ORDEN de features que arriba
-function featuresFromLive(payload: any, myId: string) {
-  const battle = payload?.battle ?? payload;
-  const players = battle?.players ?? battle?.teams?.flatMap((t: any) => t.players) ?? [];
-  const me  = players.find((p: any) => (p?.username || p?.id || p?.playerId) === myId);
-  const foe = players.find((p: any) => (p?.username || p?.id || p?.playerId) !== myId);
-
-  const hMe  = me?.heroStats?.hero;
-  const hFoe = foe?.heroStats?.hero;
-
-  // Disponibilidad real (server aplica restricciones por tipo/nivel/power/cooldown)
-  const specialsAvail = (hMe?.specialActions ?? [])
-    .filter((s: any) => !!s?.isAvailable && (s?.cooldown ?? 0) === 0 && (hMe?.power ?? 0) >= (s?.powerCost ?? 0))
-    .map((s: any) => (s.id || s.name));
-
-  const mastersAvail = (me?.heroStats?.equipped?.epicAbilites ?? [])
-    .filter((m: any) => !!m?.isAvailable && (m?.cooldown ?? 0) === 0)
-    .map((m: any) => (m.id || m.name));
-
-  // Agregación por grupo (como en tu catálogo)
-  const sAgg: Record<string, number> = {};
-  const mAgg: Record<string, number> = {};
-  specialsAvail.forEach((id: string) => { const g = SPECIAL_KIND[id]; sAgg[g] = (sAgg[g] || 0) + 1; });
-  mastersAvail.forEach((id: string) => { const g = MASTER_KIND[id];  mAgg[g] = (mAgg[g] || 0) + 1; });
-
-  // Tipo y nivel
-  const meType   = normalizeHeroTypeLive(hMe?.type ?? hMe?.heroType);
-  const foeType  = normalizeHeroTypeLive(hFoe?.type ?? hFoe?.heroType);
-  const actorOH  = oneHotType(meType);
-  const enemyOH  = oneHotType(foeType);
-  const actorLvl = Number(hMe?.level ?? 1);
-  const enemyLvl = Number(hFoe?.level ?? 1);
-
-  // Numéricas base + máscara
-  const base = [
-    safeNum(hMe?.hp_pct ?? (hMe?.health ? hMe.health/40 : 0)),
-    safeNum(hMe?.power),   safeNum(hMe?.attack),  safeNum(hMe?.defense),
-    safeNum(hFoe?.hp_pct ?? (hFoe?.health ? hFoe.health/40 : 0)),
-    safeNum(hFoe?.attack), safeNum(hFoe?.defense),
-    safeNum(sAgg["offense"]), safeNum(sAgg["defense"]), safeNum(sAgg["support"]),
-    safeNum(mAgg["offense"]), safeNum(mAgg["defense"]), safeNum(mAgg["support"]),
-  ];
-
-  const x = [...actorOH, ...enemyOH, actorLvl, enemyLvl, ...base];
-  return { x, specialsAvail, mastersAvail };
-}
-
-// ====== Modelo: cargar o entrenar con merged_turns.ndjson ======
-async function loadOrTrain(): Promise<tf.LayersModel> {
-  const modelPath = path.join(MODEL_DIR, "model.json");
-  if (fs.existsSync(modelPath)) {
-    const m = await tf.loadLayersModel(`file://${modelPath}`);
-    console.log("Modelo cargado:", MODEL_DIR);
-    return m;
-  }
-
-  if (!fs.existsSync(MERGED_FILE)) {
-    throw new Error(`No existe dataset mergeado: ${MERGED_FILE}`);
-  }
-
-  // El merged preserve turnos por sesión (gap/fin de batalla) e impone match_id y turn_index consistentes
-  // ideal para entrenar sin fugas temporales. :contentReference[oaicite:4]{index=4}
-  const lines = fs.readFileSync(MERGED_FILE, "utf-8").split("\n").map(s => s.trim()).filter(Boolean);
-  const X: number[][] = []; const Y: number[] = [];
-  for (const s of lines) {
+// ====== Helpers ACK socket ======
+async function emitAckRaw(event: string, payload: any, timeout=1600): Promise<{ok:boolean; data:any}> {
+  return new Promise(resolve => {
+    let done=false; const timer=setTimeout(()=>{ if(!done){done=true; resolve({ok:false, data:null}); }}, timeout);
     try {
-      const r = JSON.parse(s);
-      const y = LABEL_TO_Y[r?.chosen_action_kind];
-      if (y === undefined) continue; // solo filas con etiqueta
-      X.push(featuresFromRow(r)); Y.push(y);
-    } catch { /* ignora */ }
-  }
-  if (X.length < 10) throw new Error(`Dataset insuficiente (X=${X.length}). Genera más partidas.`);
-
-  const xT = tf.tensor2d(X);
-  const yT = tf.oneHot(tf.tensor1d(Y, "int32"), 3);
-  const INPUT_DIM = X[0].length; 
-
-  const model = tf.sequential();
-  model.add(tf.layers.dense({ units: 64, activation: "relu", inputShape: [INPUT_DIM] }));
-  model.add(tf.layers.dropout({ rate: 0.2 }));
-  model.add(tf.layers.dense({ units: 32, activation: "relu" }));
-  model.add(tf.layers.dense({ units: 3, activation: "softmax" })); // BASIC / SPECIAL / MASTER
-  model.compile({ optimizer: tf.train.adam(0.01), loss: "categoricalCrossentropy", metrics: ["accuracy"] });
-
-  await model.fit(xT, yT, { epochs: 12, batchSize: 64, verbose: 1 });
-
-  fs.mkdirSync(MODEL_DIR, { recursive: true });
-  await model.save(`file://${MODEL_DIR}`);
-  xT.dispose(); yT.dispose();
-  console.log("Modelo entrenado y guardado en", MODEL_DIR);
-  return model;
-}
-
-let MODEL: tf.LayersModel | null = null;
-
-// ===== elegir skill concreta dentro del grupo =====
-function pickSkill(kind: ActionType, specialsAvail: string[], mastersAvail: string[]) {
-  if (kind === "SPECIAL_SKILL") {
-    const pref = [
-      ...specialsAvail.filter(id => SPECIAL_KIND[id] === "offense"),
-      ...specialsAvail.filter(id => SPECIAL_KIND[id] === "defense"),
-      ...specialsAvail.filter(id => SPECIAL_KIND[id] === "support"),
-    ];
-    if (pref[0]) return { kind, skillId: toServerSkillId(pref[0], "SPECIAL") as string };
-  }
-  if (kind === "MASTER_SKILL") {
-    const pref = [
-      ...mastersAvail.filter(id => MASTER_KIND[id] === "offense"),
-      ...mastersAvail.filter(id => MASTER_KIND[id] === "defense"),
-      ...mastersAvail.filter(id => MASTER_KIND[id] === "support"),
-    ];
-    if (pref[0]) return { kind, skillId: toServerSkillId(pref[0], "MASTER") as string };
-  }
-  return { kind: "BASIC_ATTACK" as ActionType };
-}
-
-// ===== Emit =====
-function sendBasic(targetId: string) {
-  const action = { type: "BASIC_ATTACK" as ActionType, sourcePlayerId: MY_ID, targetPlayerId: targetId };
-  socket.emit("submitAction", { roomId: ROOM_ID, action });
-}
-function sendSpecial(input: string, targetId: string) {
-  const action = { type: "SPECIAL_SKILL" as ActionType, sourcePlayerId: MY_ID, targetPlayerId: targetId, skillId: toServerSkillId(input, "SPECIAL") };
-  console.log(`[SEND] SPECIAL_SKILL skillId=${action.skillId}`); socket.emit("submitAction", { roomId: ROOM_ID, action });
-}
-function sendMaster(input: string, targetId: string) {
-  const action = { type: "MASTER_SKILL" as ActionType, sourcePlayerId: MY_ID, targetPlayerId: targetId, skillId: toServerSkillId(input, "MASTER") };
-  console.log(`[SEND] MASTER_SKILL skillId=${action.skillId}`); socket.emit("submitAction", { roomId: ROOM_ID, action });
-}
-
-// ===== Turno con IA =====
-async function actWithAI() {
-  if (finished || currentTurn !== MY_ID) return;
-  await delay(EXTRA_DELAY_MS);
-
-  const targetId = otherPlayerId();
-  const { x, specialsAvail, mastersAvail } = featuresFromLive(lastPayload, MY_ID);
-
-  let predicted: ActionType = "BASIC_ATTACK";
-  try {
-    if (!MODEL) throw new Error("Modelo no cargado");
-    const logits = MODEL.predict(tf.tensor2d([x])) as tf.Tensor;
-    const [[pBasic, pSpec, pMaster]] = (await logits.array()) as number[][];
-    logits.dispose();
-
-    if (pSpec >= pBasic && pSpec >= pMaster && specialsAvail.length) predicted = "SPECIAL_SKILL";
-    else if (pMaster >= pBasic && pMaster >= pSpec && mastersAvail.length) predicted = "MASTER_SKILL";
-    else predicted = "BASIC_ATTACK";
-  } catch {
-    predicted = "BASIC_ATTACK";
-  }
-
-  const chosen = pickSkill(predicted, specialsAvail, mastersAvail);
-
-  if (chosen.kind === "SPECIAL_SKILL") {
-    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "SPECIAL_SKILL", skillId: chosen.skillId });
-    sendSpecial(chosen.skillId!, targetId);
-  } else if (chosen.kind === "MASTER_SKILL") {
-    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "MASTER_SKILL", skillId: chosen.skillId });
-    sendMaster(chosen.skillId!, targetId);
-  } else {
-    recordDecision(ROOM_ID, MATCH_ID, turnIndex, lastPayload, MY_ID, { kind: "BASIC_ATTACK" });
-    sendBasic(targetId);
-  }
-}
-
-// ===== Debug/ayudas =====
-function extractBattle(payload: any) { return payload?.battle ?? payload; }
-function printQuickPlayers(payload: any) {
-  const battle = extractBattle(payload);
-  const players = battle?.players ?? battle?.teams?.flatMap((t: any) => t.players) ?? [];
-  console.log("=== Players / Quick Stats ===");
-  for (const p of players) {
-    const h = p?.heroStats?.hero; if (!h) continue;
-    console.log(`- ${p.username} :: HP=${h.health} POW=${h.power} ATK=${h.attack} DEF=${h.defense}`);
-  }
-}
-async function printRaw(label: string, payload: any) {
-  console.log(`\n--- RAW ${label} ---`);
-  console.dir(payload, { depth: null });
-  printQuickPlayers(payload);
-}
-
-// ===== Sockets (NO crea sala; como cliente 2) =====
-function wireSocket() {
-  socket.on("connect", async () => {
-    console.log("Socket connected:", socket.id);
-    // La sala/batalla la crea el otro jugador (cliente 1). Este cliente SOLO se une. :contentReference[oaicite:5]{index=5}
-    socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 1 } });
-
-    // Héroe de pruebas (disponibilidad la controla el server según tipo/nivel/power/cooldown) :contentReference[oaicite:6]{index=6}
-    const HERO_STATS = {
-      hero: {
-        heroType: "POISON_ROGUE", level: 1, power: 8, health: 36, defense: 8, attack: 10,
-        attackBoost: { min: 1, max: 10 }, damage: { min: 1, max: 6 },
-        specialActions: ALL_SPECIALS.map(id => ({ id, name: id, actionType: "ATTACK", powerCost: 1, cooldown: 0, isAvailable: true, effect: [] })),
-        randomEffects: [
-          { randomEffectType: "DAMAGE", percentage: 55, valueApply: { min: 0, max: 0 } },
-          { randomEffectType: "CRITIC_DAMAGE", percentage: 10, valueApply: { min: 2, max: 4 } },
-          { randomEffectType: "EVADE", percentage: 5, valueApply: { min: 0, max: 0 } },
-          { randomEffectType: "RESIST", percentage: 10, valueApply: { min: 0, max: 0 } },
-          { randomEffectType: "ESCAPE", percentage: 0, valueApply: { min: 0, max: 0 } },
-          { randomEffectType: "NEGATE", percentage: 20, valueApply: { min: 0, max: 0 } },
-        ],
-      },
-      equipped: {
-        items: [], armors: [], weapons: [],
-        epicAbilites: ALL_MASTERS.map(id => ({ id, name: id, compatibleHeroType: "WARRIOR_ARMS", effects: [], cooldown: 0, isAvailable: true, masterChance: 0.1 })),
-      },
-    };
-
-    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 1, heroStats: HERO_STATS }).catch(() => {});
-    socket.emit("setHeroStats", { roomId: ROOM_ID, playerId: MY_ID, stats: HERO_STATS });
-    socket.emit("playerReady", { roomId: ROOM_ID, playerId: MY_ID, team: MY_TEAM });
-  });
-
-  socket.on("battleStarted", async (data: any) => {
-    socket.emit("joinBattle", { roomId: ROOM_ID, playerId: MY_ID });
-    turns = data?.turns || [];
-    currentTurn = turns[0] || null;
-    finished = false;
-    lastPayload = data;
-
-    const ok = startMatchIfEligible(ROOM_ID, MATCH_ID, data, MY_ID);
-    if (!ok.ok) console.log("Dataset: partida no elegible:", ok.reason);
-
-    await printRaw("battleStarted", data);
-    if (currentTurn === MY_ID) actWithAI();
-  });
-
-  socket.on("actionResolved", async (data: any) => {
-    await printRaw("actionResolved", data);
-    recordOutcome(data); // Escribe fila NDJSON con outcome
-    if (data?.state === "FINISHED" || data?.winner || data?.winningTeam) {
-      finished = true;
-      console.log("⚑ Battle finished.", data?.winner ? `Winner: ${data.winner}` : "");
-      return;
+      (socket as any).timeout(timeout).emit(event, payload, (err: any, ack?: any) => {
+        if (done) return; clearTimeout(timer); done=true;
+        if (err) return resolve({ok:false, data:err});
+        resolve({ ok:true, data: ack ?? null });
+      });
+    } catch (e) {
+      if (!done) { clearTimeout(timer); done=true; resolve({ok:false, data:e}); }
     }
-    const before = currentTurn;
-    currentTurn = data?.nextTurnPlayer || currentTurn;
-    lastPayload = data;
-    if (currentTurn === MY_ID && before !== MY_ID) turnIndex += 1;
-    if (currentTurn === MY_ID) actWithAI();
   });
-
-  socket.on("battleEnded", (data: any) => { finished = true; console.log("⚑ battleEnded:", data); });
-  socket.on("error", (err) => console.error("Socket error:", err));
 }
 
-// ==== boot ====
-(async () => {
-  try {
-    // Entrena/carga desde tu MERGED
-    MODEL = await loadOrTrain();
-  } catch (e) {
-    console.error("No se pudo cargar/entrenar el modelo:", (e as Error).message);
-    // Jugará con fallback BASIC si la IA falla
+// ====== Consulta de roster (Socket primero, REST fallback a /api/rooms) ======
+async function queryRosterViaSocket(): Promise<boolean> {
+  const candidates = ["getRoom","room:get","getRoomState","room:state","getPlayers","players:list","listPlayers"];
+  for (const ev of candidates) {
+    const { ok, data } = await emitAckRaw(ev, { roomId: ROOM_ID });
+    if (!ok || !data) continue;
+
+    const players = data.players || data.participants || data.room?.players || data.room?.participants || data;
+    const arr = Array.isArray(players) ? players : [];
+    if (!arr.length) continue;
+
+    const prev = new Set(roster);
+    roster.clear(); weReady = false; oppReady = false;
+
+    for (const p of arr) {
+      const pid = p?.id ?? p?.playerId ?? p?.username ?? p?.name ?? (typeof p === "string" ? p : "");
+      if (!pid) continue;
+      roster.add(pid);
+      const isReady =
+        Boolean(p?.ready || p?.isReady) ||
+        (typeof p?.state === "string" && p.state.toUpperCase().includes("READY"));
+      if (pid === MY_ID && isReady) weReady = true;
+      if (pid !== MY_ID && isReady) oppReady = true;
+    }
+    if (JSON.stringify([...prev]) !== JSON.stringify([...roster])) {
+      console.log(`[ai] roster(${ev}) →`, [...roster], "| weReady:", weReady, "oppReady:", oppReady);
+    }
+    return true;
   }
-  wireSocket();
+  return false;
+}
+
+async function queryRosterViaRest(): Promise<void> {
+  try {
+    // En tu server hay “listar todas las salas” (GetAllRooms) montado en /api (RoomController) :contentReference[oaicite:5]{index=5} :contentReference[oaicite:6]{index=6}
+    const { data } = await axios.get(`${API_URL}/api/rooms`);
+    const rooms = Array.isArray(data) ? data : (Array.isArray(data?.rooms) ? data.rooms : []);
+    const room = rooms.find((r: any) => (r.id ?? r.Id ?? r.roomId) === ROOM_ID);
+    if (!room) return;
+
+    const players = room.Players ?? room.players ?? room.participants ?? [];
+    const prev = new Set(roster);
+    roster.clear(); weReady = false; oppReady = false;
+
+    for (const p of players) {
+      const pid = p?.id ?? p?.playerId ?? p?.username ?? p?.name ?? "";
+      if (!pid) continue;
+      roster.add(pid);
+      const isReady =
+        Boolean(p?.ready || p?.isReady) ||
+        (typeof p?.state === "string" && p.state.toUpperCase().includes("READY"));
+      if (pid === MY_ID && isReady) weReady = true;
+      if (pid !== MY_ID && isReady) oppReady = true;
+    }
+    if (JSON.stringify([...prev]) !== JSON.stringify([...roster])) {
+      console.log(`[ai] roster(REST) →`, [...roster], "| weReady:", weReady, "oppReady:", oppReady);
+    }
+  } catch (e: any) {
+    // Si tu RoomController no expone GET /api/rooms, ignora (pero en tus casos de uso sí existe listAll) :contentReference[oaicite:7]{index=7}
+    // console.warn("[ai] GET /api/rooms falló:", e?.message ?? e);
+  }
+}
+
+// ====== Eventos de sala ======
+socket.on("playerJoined", (p: any) => {
+  if (p?.id) roster.add(p.id);
+  console.log("[ai] playerJoined:", p?.id, "| roster:", [...roster]);
+  maybeStartBattle();
+});
+socket.on("playerLeft", (p: any) => {
+  if (p?.id) roster.delete(p.id);
+  console.log("[ai] playerLeft:", p?.id, "| roster:", [...roster]);
+});
+socket.on("playerReady", (p: any) => {
+  if (!p?.playerId) return;
+  if (p.playerId === MY_ID) weReady = true; else oppReady = true;
+  console.log("[ai] playerReady recv:", p.playerId, "| weReady:", weReady, "oppReady:", oppReady);
+  maybeStartBattle();
+});
+
+// ====== Conexión y handshake ======
+socket.on("connect", async () => {
+  console.log("[ai] conectado:", socket.id);
+
+  // Crear sala si no existe (idempotente)
+  try {
+    await axios.post(`${API_URL}/api/rooms`, {
+      id: ROOM_ID, mode:"1v1", allowAI:false, credits:100, heroLevel:HERO_STATS.hero.level, ownerId:"ownerB"
+    }); // CreateRoom use-case :contentReference[oaicite:8]{index=8}
+  } catch {}
+
+  // Unirse por socket + REST (alineado con cliente 1)
+  socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: HERO_STATS.hero.level } }); // JoinRoom use-case :contentReference[oaicite:9]{index=9}
+  try {
+    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, {
+      playerId: MY_ID, heroLevel: HERO_STATS.hero.level, heroStats: HERO_STATS
+    });
+  } catch {}
+
+  // Stats y listo (no esperar ACK del ready)
+  socket.emit("setHeroStats", { roomId: ROOM_ID, playerId: MY_ID, stats: HERO_STATS }); // AssignHeroStats use-case :contentReference[oaicite:10]{index=10}
+  socket.emit("playerReady",  { roomId: ROOM_ID, playerId: MY_ID, team: TEAM }); // SetPlayerReady use-case (devuelve allReady) :contentReference[oaicite:11]{index=11}
+  weReady = true;
+
+  // Consulta inicial de roster: socket → REST
+  const gotViaSocket = await queryRosterViaSocket();
+  if (!gotViaSocket) await queryRosterViaRest();
+});
+
+// Polling ligero para no depender de eventos históricos
+setInterval(async () => {
+  if (battleJoined) return;
+  const gotViaSocket = await queryRosterViaSocket();
+  if (!gotViaSocket) await queryRosterViaRest();
+  maybeStartBattle();
+}, 1500);
+
+// ====== Arranque de batalla ======
+function maybeStartBattle() {
+  if (!battleJoined && roster.size >= 2 && weReady && oppReady) {
+    battleJoined = true;
+    console.log("[ai] ambos listos → joinBattle");
+    socket.emit("joinBattle", { roomId: ROOM_ID, playerId: MY_ID }, (ack:any)=>{
+      console.log("[ai] joinBattle ack:", ack ?? "(sin ack)");
+    });
+  }
+}
+
+// ====== Inicio de batalla / resolución ======
+socket.on("battleStarted", async (data: any) => {
+  // Asegurar unión a la batalla
+  socket.emit("joinBattle", { roomId: ROOM_ID, playerId: MY_ID });
+
+  turns = data?.turns || [];
+  currentTurn = turns[0] || null;
+  console.log("[ai] battleStarted, turns:", turns);
+
+  if (currentTurn === MY_ID) await playTurnFromState(data);
+});
+
+socket.on("actionResolved", async (data: any) => {
+  if (data?.state === "FINISHED" || data?.winner || data?.winningTeam) {
+    console.log("⚑ Battle finished.", data?.winner ? `Winner: ${data.winner}` : "");
+    return;
+  }
+  currentTurn = data?.nextTurnPlayer || currentTurn;
+  if (currentTurn === MY_ID) await playTurnFromState(data);
+});
+
+// ====== Turno IA ======
+async function playTurnFromState(payload: any) {
+  const actor: ActorState = {
+    heroType: heroKeyForAI(HERO_STATS.hero.heroType),
+    level: HERO_STATS.hero.level,
+    power: HERO_STATS.hero.power,
+    attack: HERO_STATS.hero.attack,
+    defense: HERO_STATS.hero.defense,
+    health: HERO_STATS.hero.health,
+  };
+  const enemy: EnemyState = {
+    health: Number(payload?.enemy_hp_after ?? payload?.enemy?.hp ?? 0),
+    defense: Number(payload?.enemy?.defense ?? 0),
+  };
+
+  await delay(jitter(300, 600));
+  let ai = await askAI({ actor, enemy });
+  if (!ai) { await delay(150); ai = await askAI({ actor, enemy }); }
+
+  const chosen: ActionKind = ai?.kind || localFallback(actor);
+  const targetId = getOpponent();
+
+  let serverAction: any;
+  if (chosen === "BASIC_ATTACK") {
+    serverAction = { type: "BASIC_ATTACK", sourcePlayerId: MY_ID, targetPlayerId: targetId };
+  } else {
+    const slotMap = SLOT_TO_SKILL[HERO_STATS.hero.heroType] || SLOT_TO_SKILL[heroKeyForAI(HERO_STATS.hero.heroType)];
+    const skillIdStr = slotMap?.[chosen as Slot];
+    serverAction = { type: "SPECIAL_SKILL", sourcePlayerId: MY_ID, targetPlayerId: targetId, skillId: skillIdStr };
+  }
+
+  await delay(jitter(120, 280));
+  socket.emit("submitAction", { roomId: ROOM_ID, action: serverAction }, (ack:any)=>{
+    console.log("[ai] => submitAction", serverAction.type, serverAction.skillId ? `(${serverAction.skillId})` : "", "| ack:", ack ?? "(sin ack)");
+  });
+}
+
+// ====== Errores ======
+socket.on("error", (err) => console.error("[ai] socket error:", err));
+
+// ====== Bootstrap ======
+(async () => {
+  // Crea la sala si no existe (idempotente). El router está montado en /api (index.ts del server) :contentReference[oaicite:12]{index=12}
+  try {
+    await axios.post(`${API_URL}/api/rooms`, {
+      id: ROOM_ID, mode:"1v1", allowAI:false, credits:100, heroLevel:HERO_STATS.hero.level, ownerId:"ownerB",
+    });
+  } catch {}
+  // El resto ocurre en 'connect'
 })();
+
+
+/*# En la carpeta del proyecto
+$env:SOCKET_URL="http://localhost:3000"
+$env:API_URL="http://localhost:3000"
+$env:AI_URL="http://127.0.0.1:8000"
+$env:ROOM_ID="ZZZ000"
+$env:MY_ID="playerB"
+$env:TEAM="B"
+npm run dev
+*/

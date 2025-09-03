@@ -1,0 +1,26 @@
+{
+  "features": [
+    "hero_type_id",
+    "level",
+    "power",
+    "attack",
+    "defense",
+    "health",
+    "enemy_health",
+    "enemy_def"
+  ],
+  "action_kinds": [
+    "BASIC_ATTACK",
+    "SPECIAL_SKILL_1",
+    "SPECIAL_SKILL_2",
+    "SPECIAL_SKILL_3"
+  ],
+  "string_id_map": {
+    "hero::TANK": 1,
+    "hero::POISON_ROGUE": 2,
+    "hero::WEAPONS_PAL": 3,
+    "hero::ICE_MAGE": 4,
+    "hero::FIRE_MAGE": 5,
+    "hero::MACHETE_ROGUE": 6
+  }
+}
