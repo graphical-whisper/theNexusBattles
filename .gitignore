@@ -1,3 +1,5 @@
 echo "*.zip" >> .gitignore
 echo "*.tar" >> .gitignore
 echo "*.gz" >> .gitignore
+echo "*.rar" >> .gitignore
+echo "*.7z" >> .gitignore
