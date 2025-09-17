@@ -1,0 +1,27 @@
+{
+  "actor": {
+    "hero_type": "ROGUE_POISON",
+    "hp": 65,
+    "mp": 12,
+    "level": 5,
+    "cooldowns": {
+      "SPECIAL_SKILL_1": 0,
+      "SPECIAL_SKILL_2": 0,
+      "SPECIAL_SKILL_3": 2
+    },
+    "buffs": {},
+    "debuffs": {}
+  },
+  "enemy": {
+    "hero_type": "MAGE_FIRE",
+    "hp": 42,
+    "mp": 6,
+    "level": 5,
+    "cooldowns": {},
+    "buffs": {},
+    "debuffs": {}
+  },
+  "turn": 3,
+  "rng": 123,
+  "forbidden_actions": []
+}

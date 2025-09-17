@@ -7,7 +7,7 @@ import { startMatchIfEligible, recordDecision, recordOutcome } from "./dataset_l
 type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 const API_URL     = "http://localhost:3000";
 const SOCKET_URL  = "http://localhost:3000";
-const ROOM_ID     = "ZZZ000";
+const ROOM_ID     = "yyy";
 const MY_ID       = "playerA";               // Cliente 1
 const MY_TEAM     = "A";
 const MATCH_ID    = `${ROOM_ID}-${Date.now()}`;
@@ -97,11 +97,11 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 const HERO_STATS = {
   hero: {
     heroType: "MACHETE_ROGUE",
-    level: 2,
-    power: 8 * 2,
-    health: 36 * 2,
-    defense: 8 * 2,
-    attack: 10 * 2,
+    level: 5,
+    power: 8 * 5,
+    health: 36 * 5,
+    defense: 8 * 5,
+    attack: 10 * 5,
     attackBoost: { min: 1, max: 10 },
     damage: { min: 1, max: 8 },
 
@@ -234,11 +234,11 @@ function wireSocket() {
     console.log("Socket connected:", socket.id);
     // Crear sala (si ya existe, se ignora el error) — igual que el cliente 1 manual
     await axios.post(`${API_URL}/api/rooms`, {
-      id: ROOM_ID, mode: "1v1", allowAI: false, credits: 100, heroLevel: 1, ownerId: "ownerA",
+      id: ROOM_ID, mode: "1v1", allowAI: false, credits: 100, heroLevel: 5, ownerId: "ownerA",
     }).catch(() => {});
 
-    socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 1 } });
-    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 1, heroStats: HERO_STATS }).catch(() => {});
+    socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 5 } });
+    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 5, heroStats: HERO_STATS }).catch(() => {});
     socket.emit("setHeroStats", { roomId: ROOM_ID, playerId: MY_ID, stats: HERO_STATS });
     socket.emit("playerReady", { roomId: ROOM_ID, playerId: MY_ID, team: MY_TEAM });
   });

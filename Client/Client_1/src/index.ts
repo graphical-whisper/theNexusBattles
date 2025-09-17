@@ -98,11 +98,11 @@ function toServerSkillId(input: string, type: "SPECIAL" | "MASTER"): string {
 const HERO_STATS = {
   hero: {
     heroType: "POISON_ROGUE",
-    level: 1,
-    power: 8 * 1,
-    health: 36 * 1,
-    defense: 8 * 1,
-    attack: 10 * 1,
+    level: 5,
+    power: 8 * 5,
+    health: 36 * 5,
+    defense: 8 * 5,
+    attack: 10 * 5,
     attackBoost: { min: 1, max: 10 }, // 10 + 1d10
     damage:      { min: 1, max: 6 },  // 1d6
 
@@ -263,8 +263,8 @@ async function printRaw(label: string, payload: any) {
 function wireSocket() {
   socket.on("connect", async () => {
     console.log("Socket connected:", socket.id);
-    socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 1 } });
-    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 1, heroStats: HERO_STATS }).catch(() => {});
+    socket.emit("joinRoom", { roomId: ROOM_ID, player: { id: MY_ID, heroLevel: 5 } });
+    await axios.post(`${API_URL}/api/rooms/${ROOM_ID}/join`, { playerId: MY_ID, heroLevel: 5, heroStats: HERO_STATS }).catch(() => {});
     socket.emit("setHeroStats", { roomId: ROOM_ID, playerId: MY_ID, stats: HERO_STATS });
     socket.emit("playerReady", { roomId: ROOM_ID, playerId: MY_ID, team: "A" });
   });
@@ -328,7 +328,7 @@ function wireSocket() {
 // --- Run ---
 (async () => {
   await axios.post(`${API_URL}/api/rooms`, {
-    id: ROOM_ID, mode: "1v1", allowAI: false, credits: 100, heroLevel: 1, ownerId: "ownerA",
+    id: ROOM_ID, mode: "1v1", allowAI: false, credits: 100, heroLevel: 5, ownerId: "ownerA",
   }).catch(() => {});
   wireSocket();
 })();
