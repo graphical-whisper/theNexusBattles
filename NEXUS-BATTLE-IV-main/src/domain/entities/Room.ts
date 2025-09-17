@@ -18,7 +18,7 @@ export class Room {
   private teamA: Player[] = [];
   private teamB: Player[] = [];
   private phase: RoomPhase = "LOBBY";
-  private config: RoomConfig;
+  public config: RoomConfig;
 
   constructor(config: RoomConfig) {
     if (config.heroLevel < 1 || config.heroLevel > 8) {
@@ -27,7 +27,13 @@ export class Room {
     this.config = config;
   }
 
-  static fromJSON(data: any): Room {
+  static fromJSON(data: {
+    config: RoomConfig;
+    players: Player[];
+    teamA: Player[];
+    teamB: Player[];
+    phase: RoomPhase;
+  }): Room {
     const room = new Room({
       id: data.config.id,
       mode: data.config.mode,
@@ -37,9 +43,9 @@ export class Room {
       ownerId: data.config.ownerId,
     });
 
-    room.players = data.players.map((p: any) => Player.fromJSON(p));
-    room.teamA = data.teamA.map((p: any) => Player.fromJSON(p));
-    room.teamB = data.teamB.map((p: any) => Player.fromJSON(p));
+    room.players = data.players.map((p) => Player.fromJSON(p));
+    room.teamA = data.teamA.map((p) => Player.fromJSON(p));
+    room.teamB = data.teamB.map((p) => Player.fromJSON(p));
     room.phase = data.phase;
 
     return room;
@@ -59,103 +65,110 @@ export class Room {
 
   get capacity() {
     switch (this.config.mode) {
-      case "1v1": return 2;
-      case "2v2": return 4;
-      case "3v3": return 6;
+      case "1v1":
+        return 2;
+      case "2v2":
+        return 4;
+      case "3v3":
+        return 6;
     }
   }
 
-  get TeamA(){
+  get TeamA() {
     return this.teamA;
   }
 
-  get TeamB(){
+  get TeamB() {
     return this.teamB;
   }
 
   get Phase() {
-      return this.phase;
+    return this.phase;
   }
 
   get Players() {
-      return this.players;
+    return this.players;
   }
 
   set Players(players: Player[]) {
-      this.players = players;
+    this.players = players;
   }
 
   set TeamA(players: Player[]) {
-      this.teamA = players;
+    this.teamA = players;
   }
 
   set TeamB(players: Player[]) {
-      this.teamB = players;
+    this.teamB = players;
   }
 
   set Phase(phase: RoomPhase) {
-      this.phase = phase;
+    this.phase = phase;
   }
 
   addPlayer(player: Player) {
     if (this.players.length >= this.capacity) {
-      throw new Error("Room is full");
+      throw new Error("Habitación llena");
     }
-    if (this.players.find(item => item.username === player.username)){
-      throw new Error("User already in the room");
+    if (this.players.find((item) => item.username === player.username)) {
+      throw new Error("Usuario ya en la habitación");
     }
     if (player.heroLevel !== this.config.heroLevel) {
-      throw new Error("Player does not meet the hero level");
+      throw new Error("El jugador no cumple con el nivel de héroe");
     }
     this.players.push(player);
   }
 
   setHeroStats(username: string, stats: NonNullable<Player["heroStats"]>) {
-    const player = this.players.find(p => p.username === username);
+    const player = this.players.find((p) => p.username === username);
     if (!player) throw new Error("Player not in room");
     player.heroStats = stats;
   }
 
   setPlayerReady(username: string, team: "A" | "B") {
-      const player = this.players.find(p => p.username === username);
-      if (!player) throw new Error("Player not in room");
-      switch(team){
-        case "A":
-          if (this.teamA.length < this.capacity / 2) {
-            this.teamA.push(player);
-          } else {
-            throw new Error("Team A is full");
-          }
-          break;
-        case "B":
-          if (this.teamB.length < this.capacity / 2) {
-            this.teamB.push(player);
-          } else {
-            throw new Error("Team B is full");
-          }
-          break;
-      }
-      player.ready = true;
+    const player = this.players.find((p) => p.username === username);
+    if (!player) throw new Error("Player not in room");
+    switch (team) {
+      case "A":
+        if (this.teamA.length < this.capacity / 2) {
+          this.teamA.push(player);
+        } else {
+          throw new Error("Team A is full");
+        }
+        break;
+      case "B":
+        if (this.teamB.length < this.capacity / 2) {
+          this.teamB.push(player);
+        } else {
+          throw new Error("Team B is full");
+        }
+        break;
+    }
+    player.ready = true;
 
-      if (this.players.length === this.capacity && this.players.every(p => p.ready)) {
+    if (
+      this.players.length === this.capacity &&
+      this.players.every((p) => p.ready)
+    ) {
       this.phase = "PREPARING";
-      }
+    }
   }
 
   allPlayersReady(): boolean {
-      return this.players.length === this.capacity && this.players.every(p => p.ready);
+    return (
+      this.players.length === this.capacity &&
+      this.players.every((p) => p.ready)
+    );
   }
 
   removePlayer(username: string): void {
-    
-    const index = this.players.findIndex(p => p.username === username);
+    const index = this.players.findIndex((p) => p.username === username);
 
     if (index === -1) throw new Error("Player not in room");
     this.players.splice(index, 1);
 
-
-    this.teamA = this.teamA.filter(p => p.username !== username);
-    this.teamB = this.teamB.filter(p => p.username !== username);
+    this.teamA = this.teamA.filter((p) => p.username !== username);
+    this.teamB = this.teamB.filter((p) => p.username !== username);
 
     if (!this.allPlayersReady()) {
       this.phase = "LOBBY";
@@ -165,8 +178,4 @@ export class Room {
       this.phase = "FINISHED";
     }
   }
-
-
-
-
 }

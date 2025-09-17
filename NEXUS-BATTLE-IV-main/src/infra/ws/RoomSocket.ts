@@ -4,24 +4,31 @@ import { AssignHeroStats } from "../../app/useCases/rooms/AssignHeroStats";
 import { BattleService } from "../../app/services/BattleService";
 import { LeaveRoom } from "../../app/useCases/rooms/LeaveRoom";
 import { BattleSocket } from "./BattleSocket";
-import InMemoryBattleRepository from "../db/InMemoryBattleRepository";
+// import RedisRoomRepository from "../db/RedisRoomRepository";
+// import RedisBattleRepository from "../db/RedisBattleRepository";
 import { InMemoryRoomRepository } from "../db/InMemoryRoomRepository";
+import InMemoryBattleRepository from "../db/InMemoryBattleRepository";
+import { RewardService } from "../../app/services/RewardService";
+import { InventoryApiClient } from "../clients/InventoryApiClient";
+import InMemoryRewardsRepository from "../db/InMemoryRewardsRepository";
 
 const roomRepo = InMemoryRoomRepository.getInstance();
 const battleRepo = InMemoryBattleRepository.getInstance();
+const rewardRepo = InMemoryRewardsRepository.getInstance();
+
 const setReady = new SetPlayerReady(roomRepo);
 const assignStats = new AssignHeroStats(roomRepo);
 const battleService = new BattleService(roomRepo, battleRepo);
 const leaveRoom = new LeaveRoom(roomRepo);
 
-export function setupRoomSocket(io: Server) {
+export default function setupRoomSocket(io: Server) {
+    const rewardService = new RewardService(roomRepo, rewardRepo, battleRepo, new InventoryApiClient());
+    const enhancedBattleService = new BattleService(roomRepo, battleRepo, rewardService);
+    const battleSocket = new BattleSocket(io, enhancedBattleService, rewardService);
 
-  const battleSocket = new BattleSocket(io, battleService);
-  
   io.on("connection", (socket) => {
-
     console.log(`Client connected ${socket.id}`);
-    
+
     socket.on("joinRoom", ({ roomId, player }) => {
       socket.join(roomId);
       io.to(roomId).emit("playerJoined", player);
@@ -29,11 +36,14 @@ export function setupRoomSocket(io: Server) {
 
     socket.on("playerReady", async ({ roomId, playerId, team }) => {
       try {
+        console.log(`Player ${playerId} is ready in room ${roomId}`);
         const allReady = await setReady.execute(roomId, playerId, team);
         io.to(roomId).emit("playerReady", { playerId });
 
         if (allReady) {
-          io.to(roomId).emit("allReady", { message: "All players ready, preparing battle..." });
+          io.to(roomId).emit("allReady", {
+            message: "All players ready, preparing battle...",
+          });
           const battle = await battleService.createBattleFromRoom(roomId);
           const sockets = await io.in(roomId).fetchSockets();
           sockets.forEach((remoteSocket) => {
@@ -42,48 +52,74 @@ export function setupRoomSocket(io: Server) {
               battleSocket.attachHandlers(realSocket);
             }
           });
-          io.to(roomId).emit("battleStarted", 
-            { 
-              message: "Battle has started!",
-              turns: battle.turnOrder,
-            });
-        } 
-      } catch (err: any) {
-        socket.emit("error", { error: err.message });
+          console.log("Battle created, notifying players...");
+          io.to(roomId).emit("battleStarted", {
+            message: "Battle has started!",
+            turns: battle.turnOrder,
+            battle: battle,
+          });
+        }
+      } catch (err: unknown) {
+        if (err instanceof Error) {
+          socket.emit("error", { error: err.message });
+        } else {
+          socket.emit("error", { error: String(err) });
+        }
       }
     });
 
     socket.on("setHeroStats", ({ roomId, playerId, stats }) => {
       try {
+        console.log(
+          `Setting hero stats for player ${playerId} in room ${roomId}`
+        );
         assignStats.execute(roomId, playerId, stats);
         io.to(roomId).emit("heroStatsSet", { playerId, stats });
-      } catch (err: any) {
-        socket.emit("error", { error: err.message });
-      }
-    });
-
-     socket.on("leaveRoom", async ({ roomId, playerId }: { roomId: string, playerId: string }) => {
-      try {
-        socket.leave(roomId);
-        io.to(roomId).emit("playerLeft", { playerId });
-      } catch (err: any) {
-        socket.emit("error", { error: err.message });
-      }
-    });
-  
-    socket.on("leaveRoom", async ({ roomId, playerId }: { roomId: string, playerId: string }) => {
-      try {
-        const closed = await leaveRoom.execute(roomId, playerId);
-
-        socket.leave(roomId);
-
-        io.to(roomId).emit("playerLeft", { playerId, roomClosed: closed });
-        if (closed) {
-          io.to(roomId).emit("roomClosed", { roomId });
+      } catch (err: unknown) {
+        if (err instanceof Error) {
+          socket.emit("error", { error: err.message });
+        } else {
+          socket.emit("error", { error: String(err) });
         }
-      } catch (err: any) {
-        socket.emit("error", { error: err.message });
       }
     });
+
+    socket.on(
+      "leaveRoom",
+      async ({ roomId, playerId }: { roomId: string; playerId: string }) => {
+        try {
+          socket.leave(roomId);
+          io.to(roomId).emit("playerLeft", { playerId });
+        } catch (err: unknown) {
+          if (err instanceof Error) {
+            socket.emit("error", { error: err.message });
+          } else {
+            socket.emit("error", { error: String(err) });
+          }
+        }
+      }
+    );
+
+    socket.on(
+      "leaveRoom",
+      async ({ roomId, playerId }: { roomId: string; playerId: string }) => {
+        try {
+          const closed = await leaveRoom.execute(roomId, playerId);
+
+          socket.leave(roomId);
+
+          io.to(roomId).emit("playerLeft", { playerId, roomClosed: closed });
+          if (closed) {
+            io.to(roomId).emit("roomClosed", { roomId });
+          }
+        } catch (err: unknown) {
+          if (err instanceof Error) {
+            socket.emit("error", { error: err.message });
+          } else {
+            socket.emit("error", { error: String(err) });
+          }
+        }
+      }
+    );
   });
 }

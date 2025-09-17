@@ -1,11 +1,6 @@
-# app/bot_client.py — Bot (client 2) alineado al Client_2 oficial:
-# - Usa 'turns' del payload para decidir objetivo (otherPlayerId)
-# - Actualiza current_turn con nextTurnPlayer
-# - Envia submitAction con el formato { roomId, action { type, sourcePlayerId, targetPlayerId, [skillId] } }
-# - Mantiene CD local (no repetir SPECIAL consecutiva) y finisher usando attackBoost/damage
-
+# app/bot_client.py — Bot (client 2) con payload compatible, CD local y finisher
 from __future__ import annotations
-import threading, time
+import threading, time, json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,14 +48,6 @@ def other_player_id(turns: List[str], my_id: str) -> str:
             return u
     return ""
 
-def resolve_target_id(turns: List[str], my_id: str, raw: Optional[str]) -> str:
-    inp = (raw or "").strip()
-    if not inp: return other_player_id(turns, my_id)
-    if inp in turns: return inp
-    for u in turns:
-        if u.lower() == inp.lower(): return u
-    return other_player_id(turns, my_id)
-
 # ---------- política con CD local + finisher ----------
 def decide_action(me_hero: Dict[str, Any], foe_hero: Dict[str, Any],
                   hero_type_alias: str, foe_hero_alias: str,
@@ -91,7 +78,14 @@ def decide_action(me_hero: Dict[str, Any], foe_hero: Dict[str, Any],
         cooldowns={}, buffs={}, debuffs={}
     )
     r = ia_decide(DecideRequest(actor=actor, enemy=enemy, turn=1, rng=None, forbidden_actions=forbidden))  # type: ignore
-    chosen = getattr(r, "action", r["action"])
+
+    # extracción segura del campo action (Pydantic v2 o dict)
+    if hasattr(r, "action"):
+        chosen = r.action
+    elif hasattr(r, "model_dump"):
+        chosen = r.model_dump().get("action")
+    else:
+        chosen = r["action"]
 
     if chosen in ("BASIC", "ATTACK"):
         return "BASIC_ATTACK", {}, None, "IA chose BASIC/ATTACK"
@@ -152,7 +146,6 @@ class BotClient:
             print(f"[bot:{self.cfg.player_id}] battleStarted")
             self.last_special_slot = None
             self.sio.emit("joinBattle", { "roomId": self.cfg.room_id, "playerId": self.cfg.player_id })
-            # === Leer 'turns' y turno actual como Client_2 ===
             battle = data if isinstance(data, dict) else {}
             self.turns = list(battle.get("turns") or [])
             self.current_turn = self.turns[0] if self.turns else battle.get("nextTurnPlayer")
@@ -162,7 +155,6 @@ class BotClient:
         @self.sio.on("actionResolved")
         def on_action_resolved(data):
             battle = data if isinstance(data, dict) else {}
-            # Actualizar turns si vienen
             if isinstance(battle.get("turns"), list):
                 self.turns = list(battle["turns"])
             before = self.current_turn
@@ -183,48 +175,62 @@ class BotClient:
         def connect_error(err):
             print(f"[bot:{self.cfg.player_id}] connect_error: {err}")
 
-    # ====== actuar solo cuando sea mi turno (como Client_2) ======
+    # ====== actuar solo cuando sea mi turno ======
     def _maybe_act(self, battle_payload: Dict[str, Any]):
         if self.finished or self.current_turn != self.cfg.player_id:
             return
 
-        # Hero propio (lo tomamos del hero_stats pasado al spawn)
+        # Hero propio del spawn
         hero = (self.cfg.hero_stats.get("hero") if isinstance(self.cfg.hero_stats, dict) else {}) or {}
         hero_type_alias = _alias_hero((hero.get("heroType") or hero.get("type") or "").upper())
-        foe_hero_alias = hero_type_alias  # si no sabemos héroe rival, alias propio
+        foe_hero_alias = hero_type_alias  # si no sabemos rival, alias propio
 
         me_full = {
             "level": hero.get("level", 1), "health": hero.get("health", 0), "power": hero.get("power", 0),
             "attack": hero.get("attack", 0), "defense": hero.get("defense", 0),
             "damage": hero.get("damage"), "attackBoost": hero.get("attackBoost")
         }
-        foe_full = { "level": 1, "health": 999, "power": 0 }  # si no tenemos stats del rival
+        foe_full = { "level": 1, "health": 999, "power": 0 }
 
-        # === target exactamente como Client_2 ===
         target_id = other_player_id(self.turns, self.cfg.player_id)
         if not target_id:
             print(f"[bot:{self.cfg.player_id}] no target in turns={self.turns}")
             return
 
-        # Política con CD local
         action_type, extra, used_slot, reason = decide_action(
             me_full, foe_full, hero_type_alias, foe_hero_alias, self.last_special_slot
         )
         print(f"[bot:{self.cfg.player_id}] act: {action_type} {extra} ({reason}) → target={target_id}")
 
+        # ---- construir payload EXACTO que suele esperar el server ----
+        server_action: Dict[str, Any] = {
+            "type": action_type,                         # "BASIC_ATTACK" | "SPECIAL_SKILL"
+            "sourcePlayerId": self.cfg.player_id,
+            "targetPlayerId": target_id,
+        }
+        if action_type == "SPECIAL_SKILL":
+            # slot del special (obligatorio para el server)
+            slot = used_slot or _slot_of_skill(hero_type_alias, extra.get("skillId"))
+            if not slot:
+                slot = "SPECIAL_SKILL_1"
+            server_action["skill"] = slot       # <— clave importante
+            server_action["skillKey"] = slot    # alias visto en builds previas
+            # metadato opcional (no debería romper)
+            if "skillId" in extra:
+                server_action["skillId"] = extra["skillId"]
+
+        payload = { "roomId": self.cfg.room_id, "action": server_action }
+
         def _ack(*args, **kwargs):
             print(f"[bot:{self.cfg.player_id}] submitAction ack:", args or kwargs)
 
-        action = {
-            "type": action_type,
-            "sourcePlayerId": self.cfg.player_id,
-            "targetPlayerId": target_id,
-            **extra
-        }
-        # Formato EXACTO del Client_2:
-        self.sio.emit("submitAction", { "roomId": self.cfg.room_id, "action": action }, callback=_ack)
+        # log visible del payload que se envía
+        print(f"[bot:{self.cfg.player_id}] submitAction payload -> {json.dumps(payload, ensure_ascii=False)}")
 
-        # CD local: bloquear solo el siguiente turno si fue SPECIAL
+        # emitir exactamente como el Client_2: { roomId, action }
+        self.sio.emit("submitAction", payload, callback=_ack)
+
+        # CD local: bloquear solo si usamos SPECIAL
         self.last_special_slot = used_slot if action_type == "SPECIAL_SKILL" else None
 
     # ====== ciclo de vida ======
