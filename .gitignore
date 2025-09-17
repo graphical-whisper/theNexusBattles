@@ -1,0 +1,3 @@
+echo "*.zip" >> .gitignore
+echo "*.tar" >> .gitignore
+echo "*.gz" >> .gitignore
