@@ -14,6 +14,7 @@ Servicio HTTP ligero para decisiones de IA en **The Nexus Battles IV**.
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+pip install python-socketio
 python -m app.server
 # luego:
 curl -s http://localhost:8000/health
@@ -60,3 +61,28 @@ export async function decideAction(payload) {
 ## Modelos
 
 Coloca tu modelo en `./models/hero_action_selector.keras` (o `.h5`). Si no existe o falla al cargar, el servicio sigue corriendo con reglas.
+
+## Curl de prueba
+
+curl -X POST http://localhost:8000/v1/bot/spawn \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "room_id": "ZZZ000",
+    "player_id": "playerB",
+    "team": "B",
+    "hero_level": 5,
+    "socket_url": "http://localhost:3000",
+    "api_url": "http://localhost:3000",
+    "hero_stats": {
+      "hero": {
+        "heroType": "POISON_ROGUE",
+        "level": 5,
+        "power": 40,
+        "health": 180,
+        "defense": 40,
+        "attack": 50,
+        "attackBoost": { "min": 1, "max": 10 },
+        "damage": { "min": 1, "max": 6 }
+      }
+    }
+  }'
