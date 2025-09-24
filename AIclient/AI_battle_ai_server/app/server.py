@@ -1,4 +1,4 @@
-# server.py — IA Server + Bot spawner (2 pasos con inventario externo)
+# server.py — IA Server + Bot spawner (2 pasos + Misiones)
 from __future__ import annotations
 import os
 import hashlib
@@ -148,7 +148,7 @@ def _featurize(actor: BattleSide, enemy: BattleSide) -> np.ndarray:
     return vec[None, :]
 
 # ======================= App & policy ============================
-app = FastAPI(title="NexusBattle IA Server", version="4.0.0")
+app = FastAPI(title="NexusBattle IA Server", version="4.1.0")
 _model = None
 
 @app.on_event("startup")
@@ -205,30 +205,14 @@ def decide(req: DecideRequest) -> DecideResponse:
     return DecideResponse(action=act, reason=reason, confidence=conf,
                           skill_id=(meta or {}).get("id"), skill_name=(meta or {}).get("name"))
 
-# ======================= Bot spawn (2 pasos) =====================
-class SpawnBotRequest(BaseModel):
-    room_id: str
-    player_id: str
-    team: Literal["A", "B"]
-    hero_level: int = 1
-    socket_url: str = Field("http://localhost:3000", description="Socket.IO base URL del game server")
-    api_url: Optional[str] = Field("http://localhost:3000", description="Base URL HTTP del game server (opcional)")
-    rng: Optional[int] = Field(None, description="Semilla opcional para elección determinística del héroe")
-
-class StopBotRequest(BaseModel):
-    room_id: str
-    player_id: str
-
-# Registro en memoria de bots en ejecución
-_BOTS: Dict[Tuple[str, str], Any] = {}
-
+# =================== Utilidades de inventario ====================
 def _allowed_hero_types() -> List[str]:
-    # Excluir héroes no permitidos (p.ej. 'CHAMAN', 'MEDICO') si existieran
+    # Excluir héroes no permitidos
     banned = {"CHAMAN", "MEDICO", "SHAMAN", "HEALER"}
     return [ht for ht in HERO_SPECIALS.keys() if ht.upper() not in banned]
 
 def _choose_hero_type(room_id: str, player_id: str, level: int, rng: Optional[int]) -> str:
-    """Elección determinística (no puramente aleatoria): hash(room,player,level[,rng])."""
+    """Elección determinística: hash(room,player,level[,rng])."""
     pool = _allowed_hero_types()
     if not pool:
         raise HTTPException(status_code=500, detail="No hay tipos de héroe disponibles")
@@ -291,6 +275,23 @@ def _local_hero_stats(hero_type: str, hero_level: int) -> Dict[str, Any]:
         "damage": {"min": 1, "max": 6 + (lvl // 6)},
     }
 
+# ======================= Bot spawn (2 pasos) =====================
+class SpawnBotRequest(BaseModel):
+    room_id: str
+    player_id: str
+    team: Literal["A", "B"]
+    hero_level: int = 1
+    socket_url: str = Field("http://localhost:3000", description="Socket.IO base URL del game server")
+    api_url: Optional[str] = Field("http://localhost:3000", description="Base URL HTTP del game server (opcional)")
+    rng: Optional[int] = Field(None, description="Semilla opcional para elección determinística del héroe")
+
+class StopBotRequest(BaseModel):
+    room_id: str
+    player_id: str
+
+# Registro en memoria de bots en ejecución
+_BOTS: Dict[Tuple[str, str], Any] = {}
+
 @app.post("/v1/bot/spawn")
 def bot_spawn(req: SpawnBotRequest):
     """
@@ -307,10 +308,8 @@ def bot_spawn(req: SpawnBotRequest):
 
     hero_type = _choose_hero_type(req.room_id, req.player_id, req.hero_level, req.rng)
     inv_stats = _fetch_hero_stats_from_inventory(hero_type, req.hero_level)
-    # El BotClient espera stats anidados bajo "hero"
     hero_stats_payload = {"hero": inv_stats}
 
-    # Import diferido para evitar ciclos
     from app.bot_client import BotClient, BotConfig  # type: ignore
     cfg = BotConfig(
         socket_url=req.socket_url, api_url=req.api_url,
@@ -328,7 +327,7 @@ def bot_spawn(req: SpawnBotRequest):
         "player_id": req.player_id,
         "team": req.team,
         "hero_type": hero_type,
-        "hero_stats": inv_stats,     # plano (como lo devuelve inventario)
+        "hero_stats": inv_stats,
         "inventory_url": _inventory_url(),
     }
 
@@ -347,6 +346,154 @@ def bot_stop(req: StopBotRequest):
 @app.get("/v1/bot/list")
 def bot_list():
     return [{"room_id": k[0], "player_id": k[1]} for k in _BOTS.keys()]
+
+# ======================= Misiones (nuevo) =======================
+class MissionSpawnRequest(BaseModel):
+    room_id: str
+    socket_url: str = Field("http://localhost:3000")
+    api_url: Optional[str] = Field("http://localhost:3000")
+    # Ids y equipos (por defecto jugador en A, enemigo en B)
+    player_id: str = Field("playerA")
+    player_team: Literal["A","B"] = Field("A")
+    enemy_id: str = Field("playerB")
+    enemy_team: Literal["A","B"] = Field("B")
+    # Héroe del jugador con sus datos (estructura del inventario)
+    player_hero: Dict[str, Any]  # {"heroType","level","power","health","defense","attack","attackBoost","damage", ...}
+    # Maestro: explícito o probabilístico
+    master: Optional[bool] = Field(None, description="Si True, el enemigo es maestro (+2 niveles). Si None, se decide por master_chance.")
+    master_chance: Optional[float] = Field(0.2, ge=0.0, le=1.0, description="Probabilidad de maestro si master es None.")
+    rng: Optional[int] = Field(None, description="Semilla para decisión determinística.")
+
+class MissionStopRequest(BaseModel):
+    room_id: str
+    player_id: Optional[str] = None
+    enemy_id: Optional[str] = None
+
+def _decide_master(room_id: str, player_id: str, enemy_id: str, base_level: int,
+                   explicit: Optional[bool], chance: Optional[float], rng: Optional[int]) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    p = 0.2 if chance is None else max(0.0, min(1.0, float(chance)))
+    seed = f"master|{room_id}|{player_id}|{enemy_id}|{base_level}|{rng if rng is not None else ''}"
+    h = hashlib.sha256(seed.encode("utf-8")).digest()
+    # valor en [0,1)
+    v = int.from_bytes(h[:4], "big") / 2**32
+    return v < p
+
+def _coerce_hero_payload(h: Dict[str, Any]) -> Dict[str, Any]:
+    """Garantiza que existe la estructura del inventario."""
+    req_keys = ("heroType","level","power","health","defense","attack","attackBoost","damage")
+    out = dict(h or {})
+    missing = [k for k in req_keys if k not in out]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"player_hero missing keys: {missing}")
+    return out
+
+@app.post("/v1/mission/spawn")
+def mission_spawn(req: MissionSpawnRequest):
+    """
+    Recibe el héroe del jugador con sus datos completos.
+    Genera un enemigo aleatorio (opción de maestro ⇒ +2 niveles).
+    Crea dos bots (jugador y enemigo) controlados por la IA en el mismo room.
+    """
+    # 1) Normalizar héroe del jugador
+    p_hero = _coerce_hero_payload(req.player_hero)
+    p_level = int(p_hero.get("level", 1))
+    p_hero_stats = {"hero": p_hero}
+
+    # 2) Elegir tipo de héroe enemigo y si es maestro
+    enemy_is_master = _decide_master(
+        room_id=req.room_id,
+        player_id=req.player_id,
+        enemy_id=req.enemy_id,
+        base_level=p_level,
+        explicit=req.master,
+        chance=req.master_chance,
+        rng=req.rng
+    )
+    # Nivel enemigo (+2 si maestro; límite 99)
+    e_level = min(99, p_level + (2 if enemy_is_master else 0))
+    # Tipo enemigo determinístico
+    e_type = _choose_hero_type(req.room_id, req.enemy_id, e_level, req.rng)
+
+    # 3) Stats del enemigo desde inventario (o fallback local)
+    e_stats_plain = _fetch_hero_stats_from_inventory(e_type, e_level)
+    e_hero_stats = {"hero": e_stats_plain}
+
+    # 4) Crear y arrancar ambos bots
+    from app.bot_client import BotClient, BotConfig  # type: ignore
+
+    # Jugador (controlado por IA)
+    key_player = (req.room_id, req.player_id)
+    if key_player not in _BOTS:
+        cfg_a = BotConfig(
+            socket_url=req.socket_url, api_url=req.api_url,
+            room_id=req.room_id, player_id=req.player_id, team=req.player_team,
+            hero_stats=p_hero_stats, hero_level=p_level
+        )
+        bot_a = BotClient(cfg_a)
+        bot_a.start()
+        _BOTS[key_player] = bot_a
+
+    # Enemigo (controlado por IA)
+    key_enemy = (req.room_id, req.enemy_id)
+    if key_enemy not in _BOTS:
+        cfg_b = BotConfig(
+            socket_url=req.socket_url, api_url=req.api_url,
+            room_id=req.room_id, player_id=req.enemy_id, team=req.enemy_team,
+            hero_stats=e_hero_stats, hero_level=e_level
+        )
+        bot_b = BotClient(cfg_b)
+        bot_b.start()
+        _BOTS[key_enemy] = bot_b
+
+    return {
+        "ok": True,
+        "status": "mission-spawned",
+        "room_id": req.room_id,
+        "player": {
+            "id": req.player_id, "team": req.player_team,
+            "hero": p_hero,
+        },
+        "enemy": {
+            "id": req.enemy_id, "team": req.enemy_team,
+            "is_master": enemy_is_master,
+            "hero": e_stats_plain,
+        },
+        "inventory_url": _inventory_url(),
+    }
+
+@app.post("/v1/mission/stop")
+def mission_stop(req: MissionStopRequest):
+    """
+    Detiene bots asociados al room de misión.
+    Si se pasan player_id/enemy_id, detiene solo esos; si no, ambos.
+    """
+    stopped = []
+    if req.player_id:
+        k = (req.room_id, req.player_id)
+        b = _BOTS.pop(k, None)
+        if b:
+            try: b.stop()
+            except Exception: pass
+            stopped.append({"room_id": req.room_id, "player_id": req.player_id})
+    if req.enemy_id:
+        k = (req.room_id, req.enemy_id)
+        b = _BOTS.pop(k, None)
+        if b:
+            try: b.stop()
+            except Exception: pass
+            stopped.append({"room_id": req.room_id, "player_id": req.enemy_id})
+    if not req.player_id and not req.enemy_id:
+        # detener ambos si existen
+        for pid in list(_BOTS.keys()):
+            if pid[0] == req.room_id:
+                b = _BOTS.pop(pid, None)
+                if b:
+                    try: b.stop()
+                    except Exception: pass
+                    stopped.append({"room_id": pid[0], "player_id": pid[1]})
+    return {"ok": True, "stopped": stopped}
 
 # ========================= Entrypoint ============================
 if __name__ == "__main__":

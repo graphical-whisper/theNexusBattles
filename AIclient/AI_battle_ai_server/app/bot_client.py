@@ -1,4 +1,4 @@
-# app/bot_client.py — Bot (client 2) con payload compatible, CD local y finisher
+# app/bot_client.py — Bot (client 2) con handshake de room, reintentos y payload compatible
 from __future__ import annotations
 import threading, time, json
 from dataclasses import dataclass
@@ -118,7 +118,58 @@ class BotClient:
         self.current_turn: Optional[str] = None
         self.finished = False
         self.last_special_slot: Optional[str] = None
+
+        # Handshake state
+        self._join_ack_received = False
+        self._stats_ready_sent = False
+        self._stats_ready_attempts = 0
+        self._max_attempts = 8
+
         self._wire()
+
+    # -------- Handshake helpers --------
+    def _after_join(self):
+        """Envia setHeroStats y luego playerReady, con control de reintentos/backoff."""
+        if self._stats_ready_sent:
+            return
+        self._stats_ready_attempts += 1
+
+        # No intentes infinitamente
+        if self._stats_ready_attempts > self._max_attempts:
+            print(f"[bot:{self.cfg.player_id}] setHeroStats/playerReady max retries reached")
+            return
+
+        # 1) setHeroStats
+        try:
+            payload = {
+                "roomId": self.cfg.room_id,
+                "playerId": self.cfg.player_id,
+                "stats": self.cfg.hero_stats
+            }
+            print(f"[bot:{self.cfg.player_id}] → setHeroStats attempt={self._stats_ready_attempts}")
+            self.sio.emit("setHeroStats", payload)
+        except Exception as e:
+            print(f"[bot:{self.cfg.player_id}] setHeroStats emit error: {e}")
+
+        # 2) playerReady (ligero delay para que el server aplique stats)
+        def _later_ready():
+            try:
+                pr = {"roomId": self.cfg.room_id, "playerId": self.cfg.player_id, "team": self.cfg.team}
+                print(f"[bot:{self.cfg.player_id}] → playerReady attempt={self._stats_ready_attempts}")
+                self.sio.emit("playerReady", pr)
+                # Si llegamos hasta aquí sin error inmediato, marcamos como enviados.
+                self._stats_ready_sent = True
+            except Exception as e:
+                print(f"[bot:{self.cfg.player_id}] playerReady emit error: {e}")
+        threading.Timer(0.15, _later_ready).start()
+
+    def _schedule_retry_stats_ready(self, delay: float = 0.5):
+        """Programar reintento con backoff."""
+        if self._stats_ready_sent:
+            return
+        delay = min(2.0, delay)
+        print(f"[bot:{self.cfg.player_id}] scheduling retry setHeroStats/playerReady in {delay:.2f}s")
+        threading.Timer(delay, self._after_join).start()
 
     def _wire(self):
         @self.sio.event
@@ -126,20 +177,41 @@ class BotClient:
             print(f"[bot:{self.cfg.player_id}] connected")
             self.turns, self.current_turn = [], None
             self.last_special_slot = None
-            # Igual que Client_2
-            self.sio.emit("joinRoom", {
+            self._join_ack_received = False
+            self._stats_ready_sent = False
+            self._stats_ready_attempts = 0
+
+            # 1) JOIN ROOM (con ack si el server lo soporta)
+            jr = {
                 "roomId": self.cfg.room_id,
                 "player": {"id": self.cfg.player_id, "heroLevel": int(self.cfg.hero_level)}
-            })
+            }
+            def _ack_join(*args, **kwargs):
+                print(f"[bot:{self.cfg.player_id}] joinRoom ack:", args or kwargs)
+                self._join_ack_received = True
+                # Tras ack, intentamos setHeroStats + playerReady
+                self._after_join()
+
+            try:
+                # Emit con callback (si el server no soporta ack, el callback no se invoca)
+                self.sio.emit("joinRoom", jr, callback=_ack_join)
+            except TypeError:
+                # Algunas implementaciones no aceptan callback posicional
+                self.sio.emit("joinRoom", jr)
+                # Fallback: programar intento tras una pequeña espera
+                threading.Timer(0.4, self._after_join).start()
+
+            # 2) (opcional) HTTP join (si existe API http del game server)
             if self.cfg.api_url:
                 try:
                     url = f"{self.cfg.api_url.rstrip('/')}/api/rooms/{self.cfg.room_id}/join"
-                    body = {"playerId": self.cfg.player_id, "heroLevel": int(self.cfg.hero_level), "heroStats": self.cfg.hero_stats}
+                    body = {"playerId": self.cfg.player_id, "heroLevel": int(self.cfg.hero_level)}
                     requests.post(url, json=body, timeout=5)
                 except Exception as e:
                     print(f"[bot:{self.cfg.player_id}] join POST failed: {e}")
-            self.sio.emit("setHeroStats", { "roomId": self.cfg.room_id, "playerId": self.cfg.player_id, "stats": self.cfg.hero_stats })
-            self.sio.emit("playerReady",  { "roomId": self.cfg.room_id, "playerId": self.cfg.player_id, "team": self.cfg.team })
+
+            # 3) Fallback adicional: si no llega ack en ~0.6s, intentamos de todas formas
+            threading.Timer(0.6, self._after_join).start()
 
         @self.sio.on("battleStarted")
         def on_battle_started(data):
@@ -168,6 +240,19 @@ class BotClient:
             print(f"[bot:{self.cfg.player_id}] battleEnded")
 
         @self.sio.event
+        def error(err):
+            # El server puede emitir { error: "Room not found" } u otras variantes
+            try:
+                msg = err if isinstance(err, str) else err.get("error") or err.get("message") or str(err)
+            except Exception:
+                msg = str(err)
+            print(f"[bot:{self.cfg.player_id}] server error: {msg}")
+            if "room not found" in (msg or "").lower():
+                # Reintentar stats+ready con backoff incremental
+                backoff = 0.3 + 0.2 * self._stats_ready_attempts
+                self._schedule_retry_stats_ready(backoff)
+
+        @self.sio.event
         def disconnect():
             print(f"[bot:{self.cfg.player_id}] disconnected")
 
@@ -180,7 +265,6 @@ class BotClient:
         if self.finished or self.current_turn != self.cfg.player_id:
             return
 
-        # Hero propio del spawn (estructura esperada {"hero": {...}})
         hero = (self.cfg.hero_stats.get("hero") if isinstance(self.cfg.hero_stats, dict) else {}) or {}
         hero_type_alias = _alias_hero((hero.get("heroType") or hero.get("type") or "").upper())
         foe_hero_alias = hero_type_alias  # si no sabemos rival, alias propio
@@ -209,13 +293,11 @@ class BotClient:
             "targetPlayerId": target_id,
         }
         if action_type == "SPECIAL_SKILL":
-            # slot del special (obligatorio para el server)
             slot = used_slot or _slot_of_skill(hero_type_alias, extra.get("skillId"))
             if not slot:
                 slot = "SPECIAL_SKILL_1"
-            server_action["skill"] = slot       # <— clave importante
-            server_action["skillKey"] = slot    # alias visto en builds previas
-            # metadato opcional (no debería romper)
+            server_action["skill"] = slot
+            server_action["skillKey"] = slot
             if "skillId" in extra:
                 server_action["skillId"] = extra["skillId"]
 
@@ -224,10 +306,7 @@ class BotClient:
         def _ack(*args, **kwargs):
             print(f"[bot:{self.cfg.player_id}] submitAction ack:", args or kwargs)
 
-        # log visible del payload que se envía
         print(f"[bot:{self.cfg.player_id}] submitAction payload -> {json.dumps(payload, ensure_ascii=False)}")
-
-        # emitir exactamente como el Client_2: { roomId, action }
         self.sio.emit("submitAction", payload, callback=_ack)
 
         # CD local: bloquear solo si usamos SPECIAL
@@ -241,7 +320,11 @@ class BotClient:
     def _run(self):
         url = self.cfg.socket_url.rstrip("/")
         conn_url = url if url.startswith("http") else "http://" + url
-        self.sio.connect(conn_url)
+        # Si tu server soporta WebSocket, puedes forzar transporte:
+        try:
+            self.sio.connect(conn_url, transports=["websocket", "polling"])
+        except TypeError:
+            self.sio.connect(conn_url)
         try:
             while not self.finished and self.sio.connected:
                 time.sleep(0.25)
@@ -253,3 +336,14 @@ class BotClient:
         self.finished = True
         if self.sio.connected:
             self.sio.disconnect()
+
+
+@dataclass
+class BotConfig:
+    socket_url: str
+    api_url: Optional[str]
+    room_id: str
+    player_id: str
+    team: str
+    hero_stats: Dict[str, Any]
+    hero_level: int = 1

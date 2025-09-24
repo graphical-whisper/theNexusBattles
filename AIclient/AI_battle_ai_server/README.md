@@ -86,3 +86,13 @@ curl -X POST http://localhost:8000/v1/bot/spawn \
       }
     }
   }'
+
+## Listar Bots
+
+curl http://localhost:8000/v1/bot/list
+
+## Parar un Bot
+
+curl -X POST http://localhost:8000/v1/bot/stop \
+  -H 'Content-Type: application/json' \
+  -d '{"room_id":"ZZZ000","player_id":"playerB"}'
