@@ -1,13 +1,21 @@
-# server.py — IA Server + Bot spawner (client 2 impersonation)
+# server.py — IA Server + Bot spawner (2 pasos con inventario externo)
 from __future__ import annotations
 import os
+import hashlib
 from typing import List, Literal, Optional, Tuple, Dict, Any
 
 import numpy as np
+import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-# ============ Optional ML policy (lazy import) ============
+# ============================ Config ============================
+# Servicio externo de inventario (provee hero_stats)
+INVENTORY_BASE_URL = os.getenv("INVENTORY_BASE_URL", "http://localhost:9000")
+INVENTORY_HERO_STATS_PATH = os.getenv("INVENTORY_HERO_STATS_PATH", "/v1/bot/hero-stats")
+INVENTORY_TIMEOUT_SECS = float(os.getenv("INVENTORY_TIMEOUT_SECS", "5.0"))
+
+# ================= Optional ML policy (lazy import) ==============
 def _try_load_model():
     model_dir = os.path.join(os.path.dirname(__file__), "..", "models")
     for fname in ("hero_action_selector.keras", "hero_action_selector.h5"):
@@ -20,7 +28,7 @@ def _try_load_model():
                 print(f"[warn] Could not load model {fpath}: {e}")
     return None
 
-# ============ Domain ============
+# ============================ Domain ============================
 ActionKind = Literal["BASIC", "ATTACK", "SPECIAL_SKILL_1", "SPECIAL_SKILL_2", "SPECIAL_SKILL_3"]
 
 class BattleSide(BaseModel):
@@ -46,7 +54,7 @@ class DecideResponse(BaseModel):
     skill_id: Optional[str] = None
     skill_name: Optional[str] = None
 
-# ============ HERO SPECIALS ============
+# ========================= HERO SPECIALS ========================
 HERO_SPECIALS: Dict[str, List[Dict[str, Any]]] = {
     "TANK": [
         {"slot": "SPECIAL_SKILL_1", "id": "GOLPE_ESCUDO",   "name": "Golpe con escudo", "level_req": 2, "cost": 2, "effect": "+2 al ataque"},
@@ -79,7 +87,6 @@ HERO_SPECIALS: Dict[str, List[Dict[str, Any]]] = {
         {"slot": "SPECIAL_SKILL_3", "id": "PLANAZO",    "name": "Planazo",    "level_req": 8, "cost": 4, "effect": "+(2d8) ATK y +1 daño"},
     ],
 }
-
 SLOTS = ("SPECIAL_SKILL_1", "SPECIAL_SKILL_2", "SPECIAL_SKILL_3")
 
 def _normalize_cd(cooldowns: Dict[str, int]) -> Dict[str, int]:
@@ -140,8 +147,8 @@ def _featurize(actor: BattleSide, enemy: BattleSide) -> np.ndarray:
     ], dtype=np.float32)
     return vec[None, :]
 
-# ============ App & policy ============
-app = FastAPI(title="NexusBattle IA Server", version="3.0.0")
+# ======================= App & policy ============================
+app = FastAPI(title="NexusBattle IA Server", version="4.0.0")
 _model = None
 
 @app.on_event("startup")
@@ -158,6 +165,8 @@ def health():
         "supported_actions": ["BASIC","ATTACK","SPECIAL_SKILL_1","SPECIAL_SKILL_2","SPECIAL_SKILL_3"],
         "heroes": list(HERO_SPECIALS.keys()),
         "skills_by_hero": HERO_SPECIALS,
+        "inventory_base_url": INVENTORY_BASE_URL,
+        "inventory_path": INVENTORY_HERO_STATS_PATH,
     }
 
 @app.post("/v1/decide", response_model=DecideResponse)
@@ -196,39 +205,132 @@ def decide(req: DecideRequest) -> DecideResponse:
     return DecideResponse(action=act, reason=reason, confidence=conf,
                           skill_id=(meta or {}).get("id"), skill_name=(meta or {}).get("name"))
 
-# ============ Bot spawn API ============
+# ======================= Bot spawn (2 pasos) =====================
 class SpawnBotRequest(BaseModel):
     room_id: str
     player_id: str
-    team: Literal["A","B"]
-    hero_stats: Dict[str, Any]  # se reenvía tal cual a setHeroStats
+    team: Literal["A", "B"]
     hero_level: int = 1
     socket_url: str = Field("http://localhost:3000", description="Socket.IO base URL del game server")
     api_url: Optional[str] = Field("http://localhost:3000", description="Base URL HTTP del game server (opcional)")
+    rng: Optional[int] = Field(None, description="Semilla opcional para elección determinística del héroe")
 
 class StopBotRequest(BaseModel):
     room_id: str
     player_id: str
 
-# Simple in-memory registry
-_BOTS: Dict[Tuple[str,str], Any] = {}
+# Registro en memoria de bots en ejecución
+_BOTS: Dict[Tuple[str, str], Any] = {}
+
+def _allowed_hero_types() -> List[str]:
+    # Excluir héroes no permitidos (p.ej. 'CHAMAN', 'MEDICO') si existieran
+    banned = {"CHAMAN", "MEDICO", "SHAMAN", "HEALER"}
+    return [ht for ht in HERO_SPECIALS.keys() if ht.upper() not in banned]
+
+def _choose_hero_type(room_id: str, player_id: str, level: int, rng: Optional[int]) -> str:
+    """Elección determinística (no puramente aleatoria): hash(room,player,level[,rng])."""
+    pool = _allowed_hero_types()
+    if not pool:
+        raise HTTPException(status_code=500, detail="No hay tipos de héroe disponibles")
+    seed_src = f"{room_id}|{player_id}|{level}|{rng if rng is not None else ''}"
+    h = hashlib.sha256(seed_src.encode("utf-8")).digest()
+    idx = int.from_bytes(h[:4], "big") % len(pool)
+    return pool[idx]
+
+def _inventory_url() -> str:
+    return INVENTORY_BASE_URL.rstrip("/") + INVENTORY_HERO_STATS_PATH
+
+def _fetch_hero_stats_from_inventory(hero_type: str, hero_level: int) -> Dict[str, Any]:
+    """POST al servicio de inventario. Espera estructura:
+        {
+          "heroType": "...",
+          "level": 5,
+          "power": ...,
+          "health": ...,
+          "defense": ...,
+          "attack": ...,
+          "attackBoost": {"min":..,"max":..},
+          "damage": {"min":..,"max":..}
+        }
+    """
+    url = _inventory_url()
+    payload = {"hero_type": hero_type, "hero_level": int(hero_level)}
+    try:
+        resp = requests.post(url, json=payload, timeout=INVENTORY_TIMEOUT_SECS)
+        resp.raise_for_status()
+        data = resp.json()
+        # Validación mínima
+        for k in ("heroType", "level", "power", "health", "defense", "attack", "attackBoost", "damage"):
+            if k not in data:
+                raise ValueError(f"missing key '{k}' in inventory response")
+        return data
+    except Exception as e:
+        print(f"[warn] Inventory call failed ({url}): {e}. Using local fallback.")
+        return _local_hero_stats(hero_type, hero_level)
+
+def _local_hero_stats(hero_type: str, hero_level: int) -> Dict[str, Any]:
+    """Fallback local si el servicio de inventario no responde."""
+    base = {
+        "TANK":         {"power": 32, "health": 220, "defense": 52, "attack": 28},
+        "WARRIOR_ARMS": {"power": 36, "health": 200, "defense": 44, "attack": 40},
+        "MAGE_FIRE":    {"power": 44, "health": 160, "defense": 26, "attack": 46},
+        "MAGE_ICE":     {"power": 42, "health": 165, "defense": 28, "attack": 44},
+        "ROGUE_POISON": {"power": 38, "health": 180, "defense": 34, "attack": 48},
+        "ROGUE_MACHETE":{"power": 36, "health": 185, "defense": 36, "attack": 46},
+    }.get(hero_type, {"power": 30, "health": 170, "defense": 30, "attack": 35})
+    lvl = int(hero_level)
+    # Escalado sencillo por nivel
+    return {
+        "heroType": hero_type,
+        "level": lvl,
+        "power": base["power"] + 2 * lvl,
+        "health": base["health"] + 10 * lvl,
+        "defense": base["defense"] + 3 * lvl,
+        "attack": base["attack"] + 4 * lvl,
+        "attackBoost": {"min": 1, "max": max(6, min(16, 2 * lvl))},
+        "damage": {"min": 1, "max": 6 + (lvl // 6)},
+    }
 
 @app.post("/v1/bot/spawn")
 def bot_spawn(req: SpawnBotRequest):
+    """
+    Paso 1 (único POST público):
+      - Recibe datos base (room/player/team/level/URLs).
+      - Elige tipo de héroe de forma determinística (no random puro).
+      - Llama automáticamente al servicio de inventario para obtener hero_stats.
+      - Crea y arranca el bot con esos stats.
+      - Devuelve resumen (con hero_type y hero_stats para depurar).
+    """
     key = (req.room_id, req.player_id)
     if key in _BOTS:
-        return {"ok": True, "status": "already-running"}
-    # lazy import to avoid circular at module import
+        return {"ok": True, "status": "already-running", "room_id": req.room_id, "player_id": req.player_id}
+
+    hero_type = _choose_hero_type(req.room_id, req.player_id, req.hero_level, req.rng)
+    inv_stats = _fetch_hero_stats_from_inventory(hero_type, req.hero_level)
+    # El BotClient espera stats anidados bajo "hero"
+    hero_stats_payload = {"hero": inv_stats}
+
+    # Import diferido para evitar ciclos
     from app.bot_client import BotClient, BotConfig  # type: ignore
     cfg = BotConfig(
         socket_url=req.socket_url, api_url=req.api_url,
         room_id=req.room_id, player_id=req.player_id, team=req.team,
-        hero_stats=req.hero_stats, hero_level=req.hero_level
+        hero_stats=hero_stats_payload, hero_level=req.hero_level
     )
     bot = BotClient(cfg)
     bot.start()
     _BOTS[key] = bot
-    return {"ok": True, "status": "spawned"}
+
+    return {
+        "ok": True,
+        "status": "spawned",
+        "room_id": req.room_id,
+        "player_id": req.player_id,
+        "team": req.team,
+        "hero_type": hero_type,
+        "hero_stats": inv_stats,     # plano (como lo devuelve inventario)
+        "inventory_url": _inventory_url(),
+    }
 
 @app.post("/v1/bot/stop")
 def bot_stop(req: StopBotRequest):
@@ -246,7 +348,9 @@ def bot_stop(req: StopBotRequest):
 def bot_list():
     return [{"room_id": k[0], "player_id": k[1]} for k in _BOTS.keys()]
 
-# Entrypoint
+# ========================= Entrypoint ============================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.server:app", host="0.0.0.0", port=8000, reload=False)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app.server:app", host=host, port=port, reload=False)

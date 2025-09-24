@@ -107,7 +107,7 @@ class BotConfig:
     room_id: str
     player_id: str
     team: str
-    hero_stats: Dict[str, Any]
+    hero_stats: Dict[str, Any]   # esperado como {"hero": {...}}
     hero_level: int = 1
 
 class BotClient:
@@ -180,7 +180,7 @@ class BotClient:
         if self.finished or self.current_turn != self.cfg.player_id:
             return
 
-        # Hero propio del spawn
+        # Hero propio del spawn (estructura esperada {"hero": {...}})
         hero = (self.cfg.hero_stats.get("hero") if isinstance(self.cfg.hero_stats, dict) else {}) or {}
         hero_type_alias = _alias_hero((hero.get("heroType") or hero.get("type") or "").upper())
         foe_hero_alias = hero_type_alias  # si no sabemos rival, alias propio
@@ -253,14 +253,3 @@ class BotClient:
         self.finished = True
         if self.sio.connected:
             self.sio.disconnect()
-
-
-@dataclass
-class BotConfig:
-    socket_url: str
-    api_url: Optional[str]
-    room_id: str
-    player_id: str
-    team: str
-    hero_stats: Dict[str, Any]
-    hero_level: int = 1
