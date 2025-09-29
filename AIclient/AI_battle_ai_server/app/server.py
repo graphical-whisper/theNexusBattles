@@ -1,4 +1,4 @@
-# server.py — IA Server + Bot spawner (2 pasos + Misiones)
+# server.py — IA Server + Bot spawner (2 pasos + Misiones) con mapeo completo de HERO_STATS
 from __future__ import annotations
 import os
 import hashlib
@@ -10,7 +10,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 # ============================ Config ============================
-# Servicio externo de inventario (provee hero_stats)
 INVENTORY_BASE_URL = os.getenv("INVENTORY_BASE_URL", "http://localhost:9000")
 INVENTORY_HERO_STATS_PATH = os.getenv("INVENTORY_HERO_STATS_PATH", "/v1/bot/hero-stats")
 INVENTORY_TIMEOUT_SECS = float(os.getenv("INVENTORY_TIMEOUT_SECS", "5.0"))
@@ -89,8 +88,26 @@ HERO_SPECIALS: Dict[str, List[Dict[str, Any]]] = {
 }
 SLOTS = ("SPECIAL_SKILL_1", "SPECIAL_SKILL_2", "SPECIAL_SKILL_3")
 
+# ===== Alias server ↔ cliente (para heroType) =====
+SERVER_TO_CLIENT_HERO = {
+    "ROGUE_POISON": "POISON_ROGUE",
+    "ROGUE_MACHETE": "MACHETE_ROGUE",
+    "MAGE_FIRE": "FIRE_MAGE",
+    "MAGE_ICE": "ICE_MAGE",
+    "WARRIOR_ARMS": "WARRIOR_ARMS",
+    "TANK": "TANK",
+}
+CLIENT_TO_SERVER_HERO = {v: k for k, v in SERVER_TO_CLIENT_HERO.items()}
+
+def _to_client_hero_type(h: str) -> str:
+    return SERVER_TO_CLIENT_HERO.get((h or "").upper(), h)
+
+def _to_server_hero_type(h: str) -> str:
+    return CLIENT_TO_SERVER_HERO.get((h or "").upper(), h)
+
+# ======================= helpers de CD/política ==================
 def _normalize_cd(cooldowns: Dict[str, int]) -> Dict[str, int]:
-    out = {k.upper(): int(v) for k, v in cooldowns.items()}
+    out = {k.upper(): int(v) for k, v in (cooldowns or {}).items()}
     alias = {"SPECIAL1":"SPECIAL_SKILL_1","SPECIAL2":"SPECIAL_SKILL_2","SPECIAL3":"SPECIAL_SKILL_3",
              "SPECIAL_1":"SPECIAL_SKILL_1","SPECIAL_2":"SPECIAL_SKILL_2","SPECIAL_3":"SPECIAL_SKILL_3",
              "SP1":"SPECIAL_SKILL_1","SP2":"SPECIAL_SKILL_2","SP3":"SPECIAL_SKILL_3"}
@@ -148,7 +165,7 @@ def _featurize(actor: BattleSide, enemy: BattleSide) -> np.ndarray:
     return vec[None, :]
 
 # ======================= App & policy ============================
-app = FastAPI(title="NexusBattle IA Server", version="4.1.0")
+app = FastAPI(title="NexusBattle IA Server", version="4.3.0")
 _model = None
 
 @app.on_event("startup")
@@ -207,12 +224,10 @@ def decide(req: DecideRequest) -> DecideResponse:
 
 # =================== Utilidades de inventario ====================
 def _allowed_hero_types() -> List[str]:
-    # Excluir héroes no permitidos
     banned = {"CHAMAN", "MEDICO", "SHAMAN", "HEALER"}
     return [ht for ht in HERO_SPECIALS.keys() if ht.upper() not in banned]
 
 def _choose_hero_type(room_id: str, player_id: str, level: int, rng: Optional[int]) -> str:
-    """Elección determinística: hash(room,player,level[,rng])."""
     pool = _allowed_hero_types()
     if not pool:
         raise HTTPException(status_code=500, detail="No hay tipos de héroe disponibles")
@@ -225,35 +240,18 @@ def _inventory_url() -> str:
     return INVENTORY_BASE_URL.rstrip("/") + INVENTORY_HERO_STATS_PATH
 
 def _fetch_hero_stats_from_inventory(hero_type: str, hero_level: int) -> Dict[str, Any]:
-    """POST al servicio de inventario. Espera estructura:
-        {
-          "heroType": "...",
-          "level": 5,
-          "power": ...,
-          "health": ...,
-          "defense": ...,
-          "attack": ...,
-          "attackBoost": {"min":..,"max":..},
-          "damage": {"min":..,"max":..}
-        }
-    """
     url = _inventory_url()
     payload = {"hero_type": hero_type, "hero_level": int(hero_level)}
     try:
         resp = requests.post(url, json=payload, timeout=INVENTORY_TIMEOUT_SECS)
         resp.raise_for_status()
         data = resp.json()
-        # Validación mínima
-        for k in ("heroType", "level", "power", "health", "defense", "attack", "attackBoost", "damage"):
-            if k not in data:
-                raise ValueError(f"missing key '{k}' in inventory response")
         return data
     except Exception as e:
         print(f"[warn] Inventory call failed ({url}): {e}. Using local fallback.")
         return _local_hero_stats(hero_type, hero_level)
 
 def _local_hero_stats(hero_type: str, hero_level: int) -> Dict[str, Any]:
-    """Fallback local si el servicio de inventario no responde."""
     base = {
         "TANK":         {"power": 32, "health": 220, "defense": 52, "attack": 28},
         "WARRIOR_ARMS": {"power": 36, "health": 200, "defense": 44, "attack": 40},
@@ -263,9 +261,9 @@ def _local_hero_stats(hero_type: str, hero_level: int) -> Dict[str, Any]:
         "ROGUE_MACHETE":{"power": 36, "health": 185, "defense": 36, "attack": 46},
     }.get(hero_type, {"power": 30, "health": 170, "defense": 30, "attack": 35})
     lvl = int(hero_level)
-    # Escalado sencillo por nivel
+    # OJO: heroType en alias de cliente, no interno
     return {
-        "heroType": hero_type,
+        "heroType": _to_client_hero_type(hero_type),
         "level": lvl,
         "power": base["power"] + 2 * lvl,
         "health": base["health"] + 10 * lvl,
@@ -274,6 +272,95 @@ def _local_hero_stats(hero_type: str, hero_level: int) -> Dict[str, Any]:
         "attackBoost": {"min": 1, "max": max(6, min(16, 2 * lvl))},
         "damage": {"min": 1, "max": 6 + (lvl // 6)},
     }
+
+# =================== Enriquecimiento de HERO_STATS ===============
+_DEFAULT_RANDOM_EFFECTS = [
+    {"randomEffectType": "DAMAGE",        "percentage": 55, "valueApply": {"min": 0, "max": 0}},
+    {"randomEffectType": "CRITIC_DAMAGE", "percentage": 10, "valueApply": {"min": 2, "max": 4}},
+    {"randomEffectType": "EVADE",         "percentage": 5,  "valueApply": {"min": 0, "max": 0}},
+    {"randomEffectType": "RESIST",        "percentage": 10, "valueApply": {"min": 0, "max": 0}},
+    {"randomEffectType": "ESCAPE",        "percentage": 0,  "valueApply": {"min": 0, "max": 0}},
+    {"randomEffectType": "NEGATE",        "percentage": 20, "valueApply": {"min": 0, "max": 0}},
+]
+
+def _build_special_actions(server_hero_type: str) -> List[Dict[str, Any]]:
+    out = []
+    for s in HERO_SPECIALS.get(server_hero_type, []):
+        out.append({
+            "name": s["name"],
+            "actionType": "ATTACK",           # acorde a tu cliente Node
+            "powerCost": int(s.get("cost", 1)),
+            "cooldown": 0,
+            "isAvailable": True,
+            "effect": [],                     # mantenemos efecto como lista vacía (server Node lo calcula)
+        })
+    return out
+
+def _default_equipped(client_hero_type: str) -> Dict[str, Any]:
+    # Estructura mínima válida; si quieres poblarla más, añade tus ítems/armas
+    return {
+        "items": [],
+        "armors": [],
+        "weapons": [],
+        "epicAbilites": [
+            {
+                "name": f"Maestría de {client_hero_type}",
+                "compatibleHeroType": client_hero_type,
+                "effects": [],
+                "cooldown": 0,
+                "isAvailable": True,
+                "masterChance": 0.1,
+            }
+        ],
+    }
+
+def _ensure_full_hero(hero: Dict[str, Any]) -> Dict[str, Any]:
+    """Completa hero con campos faltantes y normaliza heroType (cliente)."""
+    hero = dict(hero or {})
+    # Asegurar heroType en alias cliente
+    if "heroType" in hero:
+        hero["heroType"] = _to_client_hero_type(_to_server_hero_type(str(hero["heroType"])))
+    # Defaults de daño/boost
+    hero.setdefault("attackBoost", {"min": 1, "max": 10})
+    hero.setdefault("damage", {"min": 1, "max": 6})
+    # Completar specialActions si faltan
+    if not hero.get("specialActions"):
+        server_t = _to_server_hero_type(hero.get("heroType", ""))
+        hero["specialActions"] = _build_special_actions(server_t)
+    # Completar randomEffects si faltan
+    if not hero.get("randomEffects"):
+        hero["randomEffects"] = list(_DEFAULT_RANDOM_EFFECTS)
+    return hero
+
+def _compose_full_stats(server_hero_type: str, core_stats: Dict[str, Any], equipped: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    core_stats: stats de inventario/local (pueden venir con heroType en alias cliente o no)
+    Devuelve: {"hero": {...}, "equipped": {...}} listo para setHeroStats.
+    """
+    # Normalizar heroType a cliente y asegurar campos base
+    hero = _ensure_full_hero(core_stats)
+    # Si inventario devolvió heroType interno, forzamos alias cliente
+    if "heroType" not in hero or hero["heroType"].upper() not in CLIENT_TO_SERVER_HERO:
+        hero["heroType"] = _to_client_hero_type(server_hero_type)
+    # Adjuntar equipped
+    if equipped is None:
+        equipped = _default_equipped(hero["heroType"])
+    return {"hero": hero, "equipped": equipped}
+
+def _ensure_full_stats_package(stats_pkg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Cuando el cliente (misión) te trae su propio hero, garantizar que tiene todo.
+    stats_pkg esperado ~ {"hero": {...}, "equipped": {...}} o {"heroType":..., ...}
+    """
+    if "hero" in stats_pkg:
+        hero = _ensure_full_hero(stats_pkg["hero"])
+        equipped = stats_pkg.get("equipped") or _default_equipped(hero.get("heroType", ""))
+        return {"hero": hero, "equipped": equipped}
+    else:
+        # Si vino solo el hero "plano", lo empacamos
+        hero = _ensure_full_hero(stats_pkg)
+        equipped = _default_equipped(hero.get("heroType", ""))
+        return {"hero": hero, "equipped": equipped}
 
 # ======================= Bot spawn (2 pasos) =====================
 class SpawnBotRequest(BaseModel):
@@ -294,21 +381,14 @@ _BOTS: Dict[Tuple[str, str], Any] = {}
 
 @app.post("/v1/bot/spawn")
 def bot_spawn(req: SpawnBotRequest):
-    """
-    Paso 1 (único POST público):
-      - Recibe datos base (room/player/team/level/URLs).
-      - Elige tipo de héroe de forma determinística (no random puro).
-      - Llama automáticamente al servicio de inventario para obtener hero_stats.
-      - Crea y arranca el bot con esos stats.
-      - Devuelve resumen (con hero_type y hero_stats para depurar).
-    """
     key = (req.room_id, req.player_id)
     if key in _BOTS:
         return {"ok": True, "status": "already-running", "room_id": req.room_id, "player_id": req.player_id}
 
-    hero_type = _choose_hero_type(req.room_id, req.player_id, req.hero_level, req.rng)
-    inv_stats = _fetch_hero_stats_from_inventory(hero_type, req.hero_level)
-    hero_stats_payload = {"hero": inv_stats}
+    server_hero_type = _choose_hero_type(req.room_id, req.player_id, req.hero_level, req.rng)
+    inv_stats = _fetch_hero_stats_from_inventory(server_hero_type, req.hero_level)
+    # Componer payload completo al estilo del cliente Node
+    hero_stats_payload = _compose_full_stats(server_hero_type, inv_stats, equipped=None)
 
     from app.bot_client import BotClient, BotConfig  # type: ignore
     cfg = BotConfig(
@@ -326,8 +406,8 @@ def bot_spawn(req: SpawnBotRequest):
         "room_id": req.room_id,
         "player_id": req.player_id,
         "team": req.team,
-        "hero_type": hero_type,
-        "hero_stats": inv_stats,
+        "hero_type": _to_client_hero_type(server_hero_type),
+        "hero_stats": hero_stats_payload,
         "inventory_url": _inventory_url(),
     }
 
@@ -347,22 +427,20 @@ def bot_stop(req: StopBotRequest):
 def bot_list():
     return [{"room_id": k[0], "player_id": k[1]} for k in _BOTS.keys()]
 
-# ======================= Misiones (nuevo) =======================
+# ======================= Misiones (enemigo IA) ===================
 class MissionSpawnRequest(BaseModel):
     room_id: str
     socket_url: str = Field("http://localhost:3000")
     api_url: Optional[str] = Field("http://localhost:3000")
-    # Ids y equipos (por defecto jugador en A, enemigo en B)
     player_id: str = Field("playerA")
     player_team: Literal["A","B"] = Field("A")
     enemy_id: str = Field("playerB")
     enemy_team: Literal["A","B"] = Field("B")
-    # Héroe del jugador con sus datos (estructura del inventario)
-    player_hero: Dict[str, Any]  # {"heroType","level","power","health","defense","attack","attackBoost","damage", ...}
-    # Maestro: explícito o probabilístico
-    master: Optional[bool] = Field(None, description="Si True, el enemigo es maestro (+2 niveles). Si None, se decide por master_chance.")
-    master_chance: Optional[float] = Field(0.2, ge=0.0, le=1.0, description="Probabilidad de maestro si master es None.")
-    rng: Optional[int] = Field(None, description="Semilla para decisión determinística.")
+    # Héroe del jugador (puede venir incompleto; lo completamos)
+    player_hero: Dict[str, Any]
+    master: Optional[bool] = Field(None, description="Si True, el enemigo es maestro (+2 niveles). Si None, usa master_chance.")
+    master_chance: Optional[float] = Field(0.2, ge=0.0, le=1.0)
+    rng: Optional[int] = Field(None)
 
 class MissionStopRequest(BaseModel):
     room_id: str
@@ -376,72 +454,44 @@ def _decide_master(room_id: str, player_id: str, enemy_id: str, base_level: int,
     p = 0.2 if chance is None else max(0.0, min(1.0, float(chance)))
     seed = f"master|{room_id}|{player_id}|{enemy_id}|{base_level}|{rng if rng is not None else ''}"
     h = hashlib.sha256(seed.encode("utf-8")).digest()
-    # valor en [0,1)
     v = int.from_bytes(h[:4], "big") / 2**32
     return v < p
 
-def _coerce_hero_payload(h: Dict[str, Any]) -> Dict[str, Any]:
-    """Garantiza que existe la estructura del inventario."""
-    req_keys = ("heroType","level","power","health","defense","attack","attackBoost","damage")
-    out = dict(h or {})
-    missing = [k for k in req_keys if k not in out]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"player_hero missing keys: {missing}")
-    return out
-
 @app.post("/v1/mission/spawn")
 def mission_spawn(req: MissionSpawnRequest):
-    """
-    Recibe el héroe del jugador con sus datos completos.
-    Genera un enemigo aleatorio (opción de maestro ⇒ +2 niveles).
-    Crea dos bots (jugador y enemigo) controlados por la IA en el mismo room.
-    """
-    # 1) Normalizar héroe del jugador
-    p_hero = _coerce_hero_payload(req.player_hero)
+    # 1) Normalizar/Completar héroe del jugador → paquete completo
+    p_pkg = _ensure_full_stats_package(req.player_hero if "hero" in req.player_hero else {"hero": req.player_hero})
+    p_hero = p_pkg["hero"]
     p_level = int(p_hero.get("level", 1))
-    p_hero_stats = {"hero": p_hero}
 
-    # 2) Elegir tipo de héroe enemigo y si es maestro
-    enemy_is_master = _decide_master(
-        room_id=req.room_id,
-        player_id=req.player_id,
-        enemy_id=req.enemy_id,
-        base_level=p_level,
-        explicit=req.master,
-        chance=req.master_chance,
-        rng=req.rng
-    )
-    # Nivel enemigo (+2 si maestro; límite 99)
+    # 2) Elegir enemigo y stats completos
+    enemy_is_master = _decide_master(req.room_id, req.player_id, req.enemy_id, p_level,
+                                     req.master, req.master_chance, req.rng)
     e_level = min(99, p_level + (2 if enemy_is_master else 0))
-    # Tipo enemigo determinístico
-    e_type = _choose_hero_type(req.room_id, req.enemy_id, e_level, req.rng)
+    server_enemy_type = _choose_hero_type(req.room_id, req.enemy_id, e_level, req.rng)
+    inv_enemy = _fetch_hero_stats_from_inventory(server_enemy_type, e_level)
+    e_pkg = _compose_full_stats(server_enemy_type, inv_enemy, equipped=None)
 
-    # 3) Stats del enemigo desde inventario (o fallback local)
-    e_stats_plain = _fetch_hero_stats_from_inventory(e_type, e_level)
-    e_hero_stats = {"hero": e_stats_plain}
-
-    # 4) Crear y arrancar ambos bots
+    # 3) Crear bots IA (jugador y enemigo)
     from app.bot_client import BotClient, BotConfig  # type: ignore
 
-    # Jugador (controlado por IA)
     key_player = (req.room_id, req.player_id)
     if key_player not in _BOTS:
         cfg_a = BotConfig(
             socket_url=req.socket_url, api_url=req.api_url,
             room_id=req.room_id, player_id=req.player_id, team=req.player_team,
-            hero_stats=p_hero_stats, hero_level=p_level
+            hero_stats=p_pkg, hero_level=p_level
         )
         bot_a = BotClient(cfg_a)
         bot_a.start()
         _BOTS[key_player] = bot_a
 
-    # Enemigo (controlado por IA)
     key_enemy = (req.room_id, req.enemy_id)
     if key_enemy not in _BOTS:
         cfg_b = BotConfig(
             socket_url=req.socket_url, api_url=req.api_url,
             room_id=req.room_id, player_id=req.enemy_id, team=req.enemy_team,
-            hero_stats=e_hero_stats, hero_level=e_level
+            hero_stats=e_pkg, hero_level=e_level
         )
         bot_b = BotClient(cfg_b)
         bot_b.start()
@@ -451,24 +501,16 @@ def mission_spawn(req: MissionSpawnRequest):
         "ok": True,
         "status": "mission-spawned",
         "room_id": req.room_id,
-        "player": {
-            "id": req.player_id, "team": req.player_team,
-            "hero": p_hero,
-        },
+        "player": {"id": req.player_id, "team": req.player_team, "hero": p_pkg["hero"], "equipped": p_pkg["equipped"]},
         "enemy": {
-            "id": req.enemy_id, "team": req.enemy_team,
-            "is_master": enemy_is_master,
-            "hero": e_stats_plain,
+            "id": req.enemy_id, "team": req.enemy_team, "is_master": enemy_is_master,
+            "hero": e_pkg["hero"], "equipped": e_pkg["equipped"]
         },
         "inventory_url": _inventory_url(),
     }
 
 @app.post("/v1/mission/stop")
 def mission_stop(req: MissionStopRequest):
-    """
-    Detiene bots asociados al room de misión.
-    Si se pasan player_id/enemy_id, detiene solo esos; si no, ambos.
-    """
     stopped = []
     if req.player_id:
         k = (req.room_id, req.player_id)
@@ -485,7 +527,6 @@ def mission_stop(req: MissionStopRequest):
             except Exception: pass
             stopped.append({"room_id": req.room_id, "player_id": req.enemy_id})
     if not req.player_id and not req.enemy_id:
-        # detener ambos si existen
         for pid in list(_BOTS.keys()):
             if pid[0] == req.room_id:
                 b = _BOTS.pop(pid, None)
