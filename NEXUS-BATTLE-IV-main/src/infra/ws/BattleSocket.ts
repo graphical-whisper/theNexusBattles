@@ -64,6 +64,7 @@ export class BattleSocket {
       } catch (err: unknown) {
         if (err instanceof Error) {
           socket.emit("error", { error: err.message });
+           throw new Error(err.message)
         } else {
           socket.emit("error", { error: String(err) });
         }

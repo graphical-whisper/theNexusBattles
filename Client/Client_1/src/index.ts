@@ -11,7 +11,7 @@ type ActionType = "BASIC_ATTACK" | "SPECIAL_SKILL" | "MASTER_SKILL";
 
 const API_URL = "http://localhost:3000";
 const SOCKET_URL = "http://localhost:3000";
-const ROOM_ID = "ZZZ000";
+const ROOM_ID = "ROOM-CL1";
 const MY_ID = "playerA";
 
 const readline = new Readline();
