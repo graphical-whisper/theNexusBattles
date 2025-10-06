@@ -4,4 +4,4 @@ pydantic==2.8.2
 python-socketio==5.11.3
 requests==2.32.3
 tensorflow==2.20.0
-
+numpy==1.26.0  # Compatible con tensorflow 2.20.0
