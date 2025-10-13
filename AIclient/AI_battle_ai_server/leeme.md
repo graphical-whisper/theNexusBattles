@@ -34,52 +34,7 @@ pip install -r requirements.txt
 python -m app.server
 # luego:
 curl -s http://localhost:8000/health
-Nota: si tienes un modelo, colócalo en ./models/hero_action_selector.keras (o .h5).
-Si no existe o falla al cargar, el servicio queda en modo reglas.
 
-Docker
-Dockerfile
-Copy code
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app ./app
-COPY models ./models
-EXPOSE 8000
-CMD ["python", "-m", "app.server"]
-Construir y correr:
-
-bash
-Copy code
-docker build -t nexus-ai:clean .
-docker run --rm -p 8000:8000 nexus-ai:clean
-Integración desde tu Game Server
-Ejemplo (Node/TS) para /v1/decide:
-
-ts
-Copy code
-import fetch from "node-fetch";
-
-export async function decideAction(payload) {
-  const res = await fetch("http://IA_SERVER:8000/v1/decide", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  if (!res.ok) throw new Error(`IA error ${res.status}`);
-  return await res.json();  // { action, reason, confidence, skill_id?, skill_name? }
-}
-cURL de pruebas rápidas
-0) (Opcional) Crear room en Game Server (3000)
-bash
-Copy code
-curl -X POST "http://localhost:3000/api/rooms/ROOM-CL1/join" \
-  -H "Content-Type: application/json" \
-  -d '{ "playerId": "playerA", "heroLevel": 5 }'
-1) Spawn de bot IA para jugar contra tu Cliente 1
-bash
-Copy code
 curl -X POST http://localhost:8000/v1/bot/spawn \
   -H 'Content-Type: application/json' \
   -d '{
