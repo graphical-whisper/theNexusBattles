@@ -1,14 +1,14 @@
 #!/bin/bash
 set -e
 
-echo "🔨 Construyendo imagen Docker para PI2THE..."
+echo "Construyendo imagen Docker para PI2THE..."
 docker build -t pi2the-ia-server:latest .
 
-echo "🛑 Deteniendo contenedor anterior..."
+echo "Deteniendo contenedor anterior..."
 docker stop pi2the-ia-server || true
 docker rm pi2the-ia-server || true
 
-echo "🚀 Iniciando nuevo contenedor..."
+echo "Iniciando nuevo contenedor..."
 docker run -d \
   --name pi2the-ia-server \
   -p 8000:8000 \
@@ -19,6 +19,6 @@ docker run -d \
   --restart unless-stopped \
   pi2the-ia-server:latest
 
-echo "✅ Despliegue PI2THE completado!"
-echo "📊 Ver logs: docker logs -f pi2the-ia-server"
-echo "🌐 Health check: curl http://localhost:8000/health"
+echo "Despliegue PI2THE completado!"
+echo "Ver logs: docker logs -f pi2the-ia-server"
+echo "Health check: curl http://localhost:8000/health"
