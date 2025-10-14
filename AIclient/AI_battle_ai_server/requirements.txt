@@ -1,7 +1,8 @@
-fastapi==0.114.0
-uvicorn[standard]==0.30.6
-pydantic==2.8.2
-python-socketio==5.11.3
-requests==2.32.3
-tensorflow==2.20.0
-numpy==1.26.0  # Compatible con tensorflow 2.20.0
+fastapi==0.104.1
+uvicorn==0.24.0
+python-socketio==5.10.0
+requests==2.31.0
+pydantic==2.5.0
+numpy==1.24.3
+tensorflow-cpu==2.13.0  # or tensorflow if you need GPU
+python-multipart==0.0.6
